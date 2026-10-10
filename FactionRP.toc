@@ -1,8 +1,8 @@
-## Interface: 120005
+## Interface: 120100
 ## Title: FactionRP
 ## Notes: Cross-faction RP profile sharing - a continuation of CrossRP.
 ## Author: FactionRP
-## Version: 0.1.0
+## Version: 0.1.1
 ## SavedVariables: FactionRPDB
 ## OptionalDeps: totalRP3
 ## IconTexture: Interface\ICONS\INV_Misc_GroupLooking
