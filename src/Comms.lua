@@ -65,7 +65,15 @@ end
 -- Channel -------------------------------------------------------------------
 
 --- Join the hidden same-faction relay channel (no chat tab).
+-- Joining is idempotent (client no-ops when already joined), but every join
+-- still fires CHANNEL_UI_UPDATE/CHANNEL_COUNT_UPDATE toggles in the client.
+-- Other add-ons listening to those events (notably TRP3's broadcast channel
+-- manager, which repeatedly re-evaluates its own channel index while the list
+-- churns) see extra work and can transiently resolve the wrong index.
 function Comms:joinChannel()
+	if self:channelIndex() then
+		return -- already in the channel; nothing to do
+	end
 	JoinTemporaryChannel(C.COMM_CHANNEL)
 end
 
@@ -101,8 +109,19 @@ end
 -- @param text   string The chunk.
 -- @param kind   string "CHANNEL" | "PARTY" | "RAID" | "INSTANCE_CHAT" | "WHISPER".
 -- @param target any    Channel index (for CHANNEL) or player name (for WHISPER).
+-- Routing through Chomp (shippped by TRP3, and hence by every client running
+-- any major RP AddOn) means our bulk gossip traffic is coalesced into the
+-- same global ChatThrottleLib queues as everyone else's addon traffic. Raw
+-- C_ChatInfo.SendAddonMessage bursts from the queue can stall other add-ons'
+-- queued CHANNEL messages (notably TRP3's C_SCAN map-scan requests, which are
+-- sent unthrottled at scan time and are sensitive to chat-frame send backoff).
 function Comms:sendAddon(text, kind, target)
 	self:enqueue(function()
+		local chomp = AddOn_Chomp
+		if chomp and chomp.SendAddonMessage then
+			chomp.SendAddonMessage(self.prefix, text, kind, target, "LOW")
+			return
+		end
 		if C_ChatInfo and C_ChatInfo.SendAddonMessage then
 			C_ChatInfo.SendAddonMessage(self.prefix, text, kind, target)
 		end
@@ -112,6 +131,11 @@ end
 --- Send one raw chunk to a Battle.net game account.
 function Comms:sendBNet(text, gameAccountID)
 	self:enqueue(function()
+		local chomp = AddOn_Chomp
+		if chomp and chomp.BNSendGameData then
+			chomp.BNSendGameData(gameAccountID, self.prefix, text, "LOW")
+			return
+		end
 		if BNSendGameData then
 			BNSendGameData(gameAccountID, self.prefix, text)
 		end
