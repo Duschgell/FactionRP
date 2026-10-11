@@ -32,6 +32,14 @@ When a player is "selected", their profile is extracted and stored in the intern
 database of the AddOn. A player is considered "selected" when the mouse hovers over someone,
 or someone is selected as target.
 
+A player is also "selected" indirectly: whenever the RP AddOn itself receives profile
+data over its own comm channels -- like TRP3's exchange protocol, or MSP for non-TRP3 AddOn --
+that profile is treated like a selection and re-broadcast through the network. Because
+receipts arrive per profile section, they are coalesced with a short debounce plus a
+random jitter (so many clients receiving the same profile don't all flood at once —
+the first copy to arrive suppresses the rest), and re-broadcasts drain at a bounded
+rate through a capped queue, so busy environments cannot overwhelm the comm throttle.
+
 ### Extract Profile
 
 A player's profile will be extracted from the supported AddOns. (Initially TRP3)
