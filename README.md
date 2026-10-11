@@ -92,12 +92,38 @@ This section illustrates what happens when a message needs to be broadcast:
   * Broadcast the data through the AddOn Comm Channel to share with same faction users
   * Broadcast the data through Battle.NET friends
   * Broadcast the data through friends
+  * Whisper the data to a capped set of opposite-faction members of our own communities
 * when in a part/raid:
   * Same as alone + broadcast through party/raid AddON messaging.
 
 The "AddOn Comm Channel" is a hidden chat channel (joined via `JoinTemporaryChannel`) over which
-same-faction clients exchange addon messages. Cross-faction sharing is only possible over the
-Battle.NET connections.
+same-faction clients exchange addon messages. Cross-faction sharing is possible over
+Battle.NET connections and via addon whispers to opposite-faction community members
+(see below).
+
+### Community relays
+
+WoW communities cannot carry addon messages directly, but cross-faction *whispers* —
+including addon whispers — work between members of a shared community. Every broadcast
+therefore also whispers up to `COMM_RELAY_LIMIT` opposite-faction members of our own
+subscribed clubs (online only, deduplicated by GUID across clubs). Sends are blind:
+clients without FactionRP silently discard the message, so the only cost is send-queue
+capacity. Whispers are the costliest leg, hence the small cap.
+
+Target order, so the limited slots go to the most promising relays first:
+
+1. **Confirmed FRP peers** — an opposite-faction club member we have already received
+   an FactionRP whisper from this session provably runs the AddOn.
+2. **Known cross-faction contacts** — opposite-faction club members whose profiles
+   reached us via the RP AddOn's own comms (e.g. a TRP3 profile arriving cross-faction
+   through the community): proven reachable, almost certainly RP-AddOn users.
+3. **A rotating sample** of the remaining opposite-faction roster, so coverage spreads
+   across broadcasts rather than always hitting the same members.
+
+Club member lists, member factions (`ClubMemberInfo.faction` is `NeverSecret`), and
+presence come from `C_Club`. During chat-messaging lockdown those APIs yield secrets,
+so the leg silently no-ops; whisper sends also fail gracefully
+(`AddOnMessageLockdown`) — see "Security restrictions" below.
 
 A message should be ignored when any of the following is true:
 
