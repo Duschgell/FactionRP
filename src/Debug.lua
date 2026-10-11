@@ -81,6 +81,13 @@ local function mapSize(t)
 	return n
 end
 
+-- /factionrp purge ----------------------------------------------------------
+
+ns.RegisterCommand("purge", function()
+	local n = ns.cache and ns.cache:clear() or 0
+	ns.Print("cache purged (" .. n .. " entries dropped)")
+end, "Empty the profile cache (testing)")
+
 -- /factionrp debug ----------------------------------------------------------
 
 ns.RegisterCommand("debug", function()
