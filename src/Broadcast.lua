@@ -140,20 +140,25 @@ function Broadcast:onMessage(raw, context)
 		ns.debugReceive(msg.sender, msg.subject)
 	end
 
-	-- Decode the opaque profile payload.
-	local profileData = Serializer.decodeProfile(msg.data)
-	if not profileData then
-		return -- corrupt or undecodable
-	end
-
-	local result = ns.cache:tryStore({
+	local candidate = {
 		guid = msg.subject,
 		unitID = msg.unitID,
 		addon = msg.addon,
 		originTime = msg.originTime,
 		contentVersion = msg.contentVersion,
-		data = profileData,
-	})
+	}
+
+	-- Cheap path first: duplicates and stale copies resolve without the
+	-- payload, so the (expensive) decode only runs for NEW/UPDATED content.
+	local result = ns.cache:peek(candidate)
+	if not result then
+		local profileData = Serializer.decodeProfile(msg.data)
+		if not profileData then
+			return -- corrupt or undecodable
+		end
+		candidate.data = profileData
+		result = ns.cache:tryStore(candidate)
+	end
 	if ns.debugStore then
 		ns.debugStore(result, msg.subject)
 	end
