@@ -65,12 +65,12 @@ function ns.debugSkip(unitID, reason)
 	ns.Print(("|cffffd200[skip]|r %s (%s)"):format(tostring(unitID), tostring(reason)))
 end
 
---- Log: a fanout sent the given number of cross-faction community whispers.
-function ns.debugFanout(targets)
+--- Log: a fanout sent cross-faction whispers per leg (community, guild).
+function ns.debugFanout(community, guild)
 	if not enabled() then
 		return
 	end
-	ns.Print("|cffffd200[broadcast]|r community whispers: " .. tostring(targets))
+	ns.Print(("|cffffd200[broadcast]|r whispers: %d community, %d guild"):format(community, guild))
 end
 
 local function mapSize(t)

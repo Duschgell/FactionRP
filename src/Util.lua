@@ -174,7 +174,15 @@ end
 -- messages; Unknown (0) and Offline (3) are useless targets.
 local PRESENCE_ONLINE = { [1] = true, [4] = true, [5] = true }
 
-local rosterMemo = { at = 0, xfac = {}, factionByName = {}, guidByName = {} }
+local rosterMemo = {
+	at = 0,
+	xfac = {},          -- online opposite-faction community members (names)
+	xfacGuild = {},     -- online opposite-faction guild members (names)
+	factionByName = {}, -- normalized name -> PvPFaction (may be nil)
+	guidByName = {},    -- normalized name -> GUID
+	guildByName = {},   -- normalized name -> true (guild members)
+	communityByName = {} -- normalized name -> true (community members)
+}
 local rosterBuild = nil -- incremental build state, or nil when idle
 
 -- ClubMemberInfo.faction is a PvPFaction (0 = Horde, 1 = Alliance, NeverSecret).
@@ -184,8 +192,11 @@ end
 
 local function finishRosterBuild(build)
 	rosterMemo.xfac = build.xfac
+	rosterMemo.xfacGuild = build.xfacGuild
 	rosterMemo.factionByName = build.factionByName
 	rosterMemo.guidByName = build.guidByName
+	rosterMemo.guildByName = build.guildByName
+	rosterMemo.communityByName = build.communityByName
 	rosterMemo.at = GetTime()
 	rosterBuild = nil
 end
@@ -204,7 +215,7 @@ local function stepRosterBuild(build)
 			return
 		end
 		if not build.members then
-			local ok, members = pcall(C_Club.GetClubMembers, club.clubId)
+			local ok, members = pcall(C_Club.GetClubMembers, club.id)
 			build.members = (ok and type(members) == "table") and members or {}
 			build.m = 1
 		end
@@ -216,20 +227,30 @@ local function stepRosterBuild(build)
 			build.m = build.m + 1
 			budget = budget - 1
 			-- Club APIs can fail before init or yield secrets during lockdown.
-			local okInfo, info = pcall(C_Club.GetMemberInfo, club.clubId, memberId)
+			local okInfo, info = pcall(C_Club.GetMemberInfo, club.id, memberId)
 			if okInfo and info and not info.isSelf and info.name and canaccessvalue(info.name) then
 				local key = normalizeUnitName(info.name)
 				if key then
 					build.factionByName[key] = info.faction -- may be nil
+					if club.guild then
+						build.guildByName[key] = true
+					else
+						build.communityByName[key] = true
+					end
 					if info.guid and canaccessvalue(info.guid) then
 						build.guidByName[key] = info.guid
 						if info.faction ~= nil
 							and info.faction ~= selfFaction()
 							and PRESENCE_ONLINE[info.presence]
-							and not build.seenGUID[info.guid]
 						then
-							build.seenGUID[info.guid] = true
-							build.xfac[#build.xfac + 1] = fullUnitName(info.name)
+							-- Dedup per leg: a member in the guild AND a
+							-- community is a candidate in both lists.
+							local list = club.guild and build.xfacGuild or build.xfac
+							local seen = club.guild and build.seenGuild or build.seenXfac
+							if not seen[info.guid] then
+								seen[info.guid] = true
+								list[#list + 1] = fullUnitName(info.name)
+							end
 						end
 					end
 				end
@@ -250,9 +271,33 @@ local function startRosterBuild()
 	if not ok or type(clubs) ~= "table" then
 		return
 	end
+	-- Our own guild is a club too (C_Club.GetGuildClubId) and gets the same
+	-- coverage — cross-faction guilds make its opposite-faction members
+	-- whisper-reachable. It is kept as a separate target list.
+	local list = {}
+	for _, club in ipairs(clubs) do
+		local isGuild = Enum and Enum.ClubType and club.clubType == Enum.ClubType.Guild
+		list[#list + 1] = { id = club.clubId, guild = isGuild or nil }
+	end
+	local okGuild, guildClubId = pcall(C_Club.GetGuildClubId)
+	if okGuild and guildClubId then
+		local found = false
+		for _, club in ipairs(list) do
+			if club.id == guildClubId then
+				club.guild = true
+				found = true
+				break
+			end
+		end
+		if not found then
+			list[#list + 1] = { id = guildClubId, guild = true }
+		end
+	end
 	rosterBuild = {
-		clubs = clubs, c = 1, m = 1, members = nil,
-		xfac = {}, factionByName = {}, guidByName = {}, seenGUID = {},
+		clubs = list, c = 1, m = 1, members = nil,
+		xfac = {}, xfacGuild = {}, factionByName = {}, guidByName = {},
+		guildByName = {}, communityByName = {},
+		seenXfac = {}, seenGuild = {},
 	}
 	stepRosterBuild(rosterBuild)
 end
@@ -277,6 +322,25 @@ function Util.isXfacClubMember(unitID)
 	local key = normalizeUnitName(unitID)
 	local faction = key and clubRoster().factionByName[key]
 	return faction ~= nil and faction ~= selfFaction()
+end
+
+--- Online, opposite-faction members of our own guild — the players we can
+--- reach with a cross-faction addon whisper (cross-faction guilds).
+-- @return table List of "Name-Realm" strings, deduplicated by GUID.
+function Util.xfacGuildMembers()
+	return clubRoster().xfacGuild
+end
+
+--- Whether a "Name-Realm" is a member of our guild (per the roster memo).
+function Util.isGuildClubMember(unitID)
+	local key = normalizeUnitName(unitID)
+	return key ~= nil and clubRoster().guildByName[key] == true
+end
+
+--- Whether a "Name-Realm" is a member of one of our (non-guild) communities.
+function Util.isCommunityClubMember(unitID)
+	local key = normalizeUnitName(unitID)
+	return key ~= nil and clubRoster().communityByName[key] == true
 end
 
 local function guidFromUnits(unitID)

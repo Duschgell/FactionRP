@@ -126,8 +126,11 @@ join fires channel-list churn that other addons' channel bookkeeping reacts to.
 
 WoW communities cannot carry addon messages directly, but cross-faction *whispers* —
 including addon whispers — work between members of a shared community. Every broadcast
-therefore also whispers up to `COMM_RELAY_LIMIT` opposite-faction members of our own
-subscribed clubs (online only, deduplicated by GUID across clubs). Sends are blind:
+therefore also whispers a capped set of opposite-faction members of our own
+subscribed clubs — run as **two independent legs**: communities (`COMM_RELAY_LIMIT`)
+and our own guild (`GUILD_RELAY_LIMIT`; cross-faction guilds make those members
+whisper-reachable too, and the leg is skipped entirely when guildless). Both legs
+select online members only, deduplicated by GUID across clubs. Sends are blind:
 clients without FactionRP silently discard the message, so the only cost is send-queue
 capacity. Whispers are the costliest leg, hence the small cap — a few seeded peers
 flood their own faction side anyway.
@@ -144,8 +147,10 @@ Candidate order, so the limited slots go to the most promising relays first:
 No single member should act as a relay server, so fairness is enforced two ways:
 a **round-robin cursor** spreads picks across the candidate list rather than always
 starting from the front, and each contact may be used at most `COMM_USAGE_LIMIT`
-times per `COMM_USAGE_WINDOW` seconds. Exhausted contacts are only re-used when too
-few fresh candidates remain — coverage is never dropped for lack of fresh targets.
+times per `COMM_USAGE_WINDOW` seconds — shared across both legs, so a person who is
+both guildmate and community member still has one budget. Exhausted contacts are
+only re-used when too few fresh candidates remain — coverage is never dropped for
+lack of fresh targets.
 
 Club member lists, member factions (`ClubMemberInfo.faction` is `NeverSecret`), and
 presence come from `C_Club`. The roster is rebuilt incrementally (`ROSTER_SLICE`
