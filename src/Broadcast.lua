@@ -27,12 +27,26 @@ function Broadcast:init()
 	--                 reachable RP-AddOn users, though maybe not FRP users.
 	self.knownRelays = {}
 	self.xfacContacts = {}
+
+	-- Community-relay fairness state: per-contact usage counts (so no single
+	-- member becomes a relay server) and a round-robin cursor spreading picks
+	-- across the candidate list.
+	self.commUsage = {} -- [normalized name] = { count, at }
+	self.commCursor = 0
+
+	-- Profiles queued for injection into the RP AddOn's register so its
+	-- directory fills as gossip lands (drained at a bounded rate).
+	self.injectQueue = {} -- [guid] = candidate
+	self.injectOrder = {}
 end
 
 function Broadcast:start()
 	self.playerGUID = UnitGUID("player")
 	ns.comms:setMessageHandler(function(raw, context)
 		self:onMessage(raw, context)
+	end)
+	C_Timer.NewTicker(C.INJECT_INTERVAL, function()
+		self:drainInject()
 	end)
 end
 
@@ -86,40 +100,79 @@ function Broadcast:fanOut(chunks, context)
 
 	-- Cross-faction community relays: addon whispers to members of our own
 	-- clubs. Whispers are the costliest leg, so targets are capped at
-	-- COMM_RELAY_LIMIT and ordered: confirmed FRP peers first, then known
-	-- cross-faction RP contacts, then a rotating sample of the remaining
-	-- opposite-faction roster. Blind sends are silently discarded by clients
-	-- without the AddOn, so sampling costs only send-queue slots.
+	-- COMM_RELAY_LIMIT *and* usage-limited: no single member should act as a
+	-- relay server, so each contact can be used at most COMM_USAGE_LIMIT times
+	-- per COMM_USAGE_WINDOW seconds. A round-robin cursor spreads picks across
+	-- the candidate list (confirmed FRP peers, then known xfac RP contacts,
+	-- then the opposite-faction roster). If too few fresh candidates remain,
+	-- exhausted contacts are used anyway rather than dropping coverage. Blind
+	-- sends are silently discarded by clients without the AddOn.
 	local skipName = (srcMedium == "WHISPER" and context.senderName)
 		and ns.Util.normalizeUnitName(context.senderName)
-	local seen = {}
+	local candidates, seen = {}, {}
 	if skipName then
 		seen[skipName] = true
 	end
-	local sent = 0
-	local function whisper(name)
-		if sent >= C.COMM_RELAY_LIMIT then
-			return
-		end
-		local key = ns.Util.normalizeUnitName(name)
+	local function addCandidate(name)
+		local key = name and ns.Util.normalizeUnitName(name)
 		if key and not seen[key] then
 			seen[key] = true
-			comms:sendChunksAddon(chunks, "WHISPER", name)
-			sent = sent + 1
+			candidates[#candidates + 1] = { name = name, key = key }
 		end
 	end
 	for _, unitID in pairs(self.knownRelays) do
-		whisper(unitID)
+		addCandidate(unitID)
 	end
 	for _, unitID in pairs(self.xfacContacts) do
-		whisper(unitID)
+		addCandidate(unitID)
 	end
-	local members = ns.Util.xfacClubMembers()
-	local count = #members
-	if count > 0 then
-		local offset = math.random(count)
-		for i = 0, count - 1 do
-			whisper(members[((offset + i - 1) % count) + 1])
+	for _, name in ipairs(ns.Util.xfacClubMembers()) do
+		addCandidate(name)
+	end
+
+	local now = GetTime()
+	local function usageAt(key)
+		local u = self.commUsage[key]
+		if not u or (now - u.at) > C.COMM_USAGE_WINDOW then
+			return 0
+		end
+		return u.count
+	end
+	local function bumpUsage(key)
+		local u = self.commUsage[key]
+		if u and (now - u.at) <= C.COMM_USAGE_WINDOW then
+			u.count = u.count + 1
+		else
+			self.commUsage[key] = { count = 1, at = now }
+		end
+	end
+
+	local n = #candidates
+	local sent, sentKeys = 0, {}
+	local function trySend(cand)
+		if sent >= C.COMM_RELAY_LIMIT or sentKeys[cand.key] then
+			return
+		end
+		sentKeys[cand.key] = true
+		comms:sendChunksAddon(chunks, "WHISPER", cand.name)
+		bumpUsage(cand.key)
+		sent = sent + 1
+	end
+	if n > 0 then
+		self.commCursor = self.commCursor + 1
+		local offset = ((self.commCursor - 1) % n) + 1
+		for pass = 1, 2 do
+			for i = 0, n - 1 do
+				local cand = candidates[((offset + i - 1) % n) + 1]
+				if pass == 1 and usageAt(cand.key) >= C.COMM_USAGE_LIMIT then
+					-- Exhausted this window: defer to the fill pass.
+				else
+					trySend(cand)
+				end
+			end
+			if sent >= C.COMM_RELAY_LIMIT then
+				break
+			end
 		end
 	end
 	if sent > 0 and ns.debugFanout then
@@ -227,6 +280,10 @@ function Broadcast:onMessage(raw, context)
 		return
 	end
 
+	-- Populate the RP AddOn's register as gossip lands so its directory fills
+	-- with received profiles (queued: register writes are expensive, bursty).
+	self:queueInject(candidate)
+
 	-- Relay unchanged except for SENDER (now us). Re-use the already-encoded
 	-- data verbatim rather than re-encoding.
 	local relay = Serializer.buildMessage({
@@ -239,6 +296,38 @@ function Broadcast:onMessage(raw, context)
 		data = msg.data,
 	})
 	self:fanOut(Serializer.chunk(relay), context)
+end
+
+-- Injection into the RP AddOn ------------------------------------------------
+
+--- Queue a stored profile for injection into its source AddOn's register.
+-- Dedup'd by GUID: a newer copy replaces any older pending one.
+function Broadcast:queueInject(candidate)
+	-- Our own profile is already authoritative locally; never inject it back.
+	if candidate.guid == self.playerGUID then
+		return
+	end
+	if not self.injectQueue[candidate.guid] then
+		self.injectOrder[#self.injectOrder + 1] = candidate.guid
+	end
+	self.injectQueue[candidate.guid] = candidate
+end
+
+--- Drain up to INJECT_BURST pending injections per tick.
+function Broadcast:drainInject()
+	local budget = C.INJECT_BURST
+	while budget > 0 and #self.injectOrder > 0 do
+		local guid = table.remove(self.injectOrder, 1)
+		local candidate = self.injectQueue[guid]
+		self.injectQueue[guid] = nil
+		if candidate then
+			local adapter = ns.getAdapter(candidate.addon)
+			if adapter and adapter:isAvailable() then
+				adapter:inject(candidate.unitID, candidate.data)
+			end
+		end
+		budget = budget - 1
+	end
 end
 
 --- Record an opposite-faction club member whose profile reached us over the

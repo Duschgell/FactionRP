@@ -154,6 +154,131 @@ local function fullUnitName(name)
 	return char .. "-" .. realm
 end
 
+-- Community roster ----------------------------------------------------------
+--
+-- Members of our own subscribed WoW communities are the one group of
+-- opposite-faction players we can reach directly: addon whispers work between
+-- community members across factions, and ClubMemberInfo exposes a NeverSecret
+-- `faction` field we can filter on. The roster also doubles as the name->GUID
+-- map for resolveGUID's club fallback.
+--
+-- A full scan is O(total club membership) — too much for one frame on large
+-- communities — so a stale roster is rebuilt incrementally: ROSTER_SLICE
+-- member lookups per frame via self-rescheduling timers, then the memo is
+-- swapped atomically. Callers always see the last complete roster (possibly
+-- stale or, before the first build finishes, empty); lookups during a build
+-- degrade to graceful misses.
+
+-- ClubMemberPresence values that mean the character is logged in (1 Online,
+-- 4 Away, 5 Busy). OnlineMobile (2) is the phone app and cannot receive addon
+-- messages; Unknown (0) and Offline (3) are useless targets.
+local PRESENCE_ONLINE = { [1] = true, [4] = true, [5] = true }
+
+local rosterMemo = { at = 0, xfac = {}, factionByName = {}, guidByName = {} }
+local rosterBuild = nil -- incremental build state, or nil when idle
+
+-- ClubMemberInfo.faction is a PvPFaction (0 = Horde, 1 = Alliance, NeverSecret).
+local function selfFaction()
+	return (UnitFactionGroup("player") == "Alliance") and 1 or 0
+end
+
+local function finishRosterBuild(build)
+	rosterMemo.xfac = build.xfac
+	rosterMemo.factionByName = build.factionByName
+	rosterMemo.guidByName = build.guidByName
+	rosterMemo.at = GetTime()
+	rosterBuild = nil
+end
+
+-- Process up to ROSTER_SLICE member lookups, then reschedule for the next
+-- frame. On completion the accumulated tables replace the memo atomically.
+local function stepRosterBuild(build)
+	if build ~= rosterBuild then
+		return -- superseded
+	end
+	local budget = C.ROSTER_SLICE
+	while budget > 0 do
+		local club = build.clubs[build.c]
+		if not club then
+			finishRosterBuild(build)
+			return
+		end
+		if not build.members then
+			local ok, members = pcall(C_Club.GetClubMembers, club.clubId)
+			build.members = (ok and type(members) == "table") and members or {}
+			build.m = 1
+		end
+		local memberId = build.members[build.m]
+		if not memberId then
+			build.members = nil
+			build.c = build.c + 1
+		else
+			build.m = build.m + 1
+			budget = budget - 1
+			-- Club APIs can fail before init or yield secrets during lockdown.
+			local okInfo, info = pcall(C_Club.GetMemberInfo, club.clubId, memberId)
+			if okInfo and info and not info.isSelf and info.name and canaccessvalue(info.name) then
+				local key = normalizeUnitName(info.name)
+				if key then
+					build.factionByName[key] = info.faction -- may be nil
+					if info.guid and canaccessvalue(info.guid) then
+						build.guidByName[key] = info.guid
+						if info.faction ~= nil
+							and info.faction ~= selfFaction()
+							and PRESENCE_ONLINE[info.presence]
+							and not build.seenGUID[info.guid]
+						then
+							build.seenGUID[info.guid] = true
+							build.xfac[#build.xfac + 1] = fullUnitName(info.name)
+						end
+					end
+				end
+			end
+		end
+	end
+	C_Timer.After(0, function()
+		stepRosterBuild(build)
+	end)
+end
+
+local function startRosterBuild()
+	if not C_Club or not C_Club.GetSubscribedClubs or not C_Club.GetClubMembers then
+		return
+	end
+	-- Club APIs can fail before clubs are initialized or during lockdown.
+	local ok, clubs = pcall(C_Club.GetSubscribedClubs)
+	if not ok or type(clubs) ~= "table" then
+		return
+	end
+	rosterBuild = {
+		clubs = clubs, c = 1, m = 1, members = nil,
+		xfac = {}, factionByName = {}, guidByName = {}, seenGUID = {},
+	}
+	stepRosterBuild(rosterBuild)
+end
+
+local function clubRoster()
+	if not rosterBuild and (GetTime() - rosterMemo.at) > C.COMM_ROSTER_MEMO then
+		startRosterBuild()
+	end
+	return rosterMemo
+end
+
+--- Online, opposite-faction members of our subscribed clubs — the players we
+--- can reach with a cross-faction addon whisper.
+-- @return table List of "Name-Realm" strings, deduplicated by GUID.
+function Util.xfacClubMembers()
+	return clubRoster().xfac
+end
+
+--- Whether a "Name-Realm" belongs to an opposite-faction member of one of our
+--- clubs, per the roster's NeverSecret faction field.
+function Util.isXfacClubMember(unitID)
+	local key = normalizeUnitName(unitID)
+	local faction = key and clubRoster().factionByName[key]
+	return faction ~= nil and faction ~= selfFaction()
+end
+
 local function guidFromUnits(unitID)
 	for _, token in ipairs(GUID_UNIT_TOKENS) do
 		-- Unit APIs may yield secret values during lockdown; skip those.
@@ -193,32 +318,9 @@ local function guidFromBNetFriends(unitID)
 end
 
 local function guidFromClubs(unitID)
-	if not C_Club or not C_Club.GetSubscribedClubs or not C_Club.GetClubMembers then
-		return
-	end
-	-- Club APIs can fail before clubs are initialized or yield secrets during
-	-- lockdown, so each call is guarded.
-	local ok, clubs = pcall(C_Club.GetSubscribedClubs)
-	if not ok or type(clubs) ~= "table" then
-		return
-	end
-	for _, club in ipairs(clubs) do
-		local okMembers, members = pcall(C_Club.GetClubMembers, club.clubId)
-		if okMembers and type(members) == "table" then
-			for _, memberId in ipairs(members) do
-				local okInfo, info = pcall(C_Club.GetMemberInfo, club.clubId, memberId)
-				if okInfo
-					and info
-					and info.guid
-					and canaccessvalue(info.guid)
-					and info.name
-					and normalizeUnitName(info.name) == unitID
-				then
-					return info.guid
-				end
-			end
-		end
-	end
+	-- Shares the (memoized, incrementally-built) community roster rather than
+	-- walking every club member itself.
+	return clubRoster().guidByName[unitID]
 end
 
 local guidMemo = {} -- [lowered unitID] = { guid = guid|false, expires = GetTime() }
@@ -255,89 +357,11 @@ function Util.resolveGUID(unitID)
 		end
 	end
 
+	if not guid and rosterBuild then
+		-- The roster is mid-rebuild: this miss may resolve once it finishes,
+		-- so do not memoize it as a negative result.
+		return nil
+	end
 	guidMemo[key] = { guid = guid or false, expires = now + C.GUID_RESOLVE_MEMO }
 	return guid
-end
-
--- Community roster ----------------------------------------------------------
---
--- Members of our own subscribed WoW communities are the one group of
--- opposite-faction players we can reach directly: addon whispers work between
--- community members across factions, and ClubMemberInfo exposes a NeverSecret
--- `faction` field we can filter on. We cannot see which of them run FactionRP;
--- the Broadcast layer narrows targets further with traffic-derived signals.
-
--- ClubMemberPresence values that mean the character is logged in (1 Online,
--- 4 Away, 5 Busy). OnlineMobile (2) is the phone app and cannot receive addon
--- messages; Unknown (0) and Offline (3) are useless targets.
-local PRESENCE_ONLINE = { [1] = true, [4] = true, [5] = true }
-
-local rosterMemo = { at = 0 } -- { xfac = {...names}, factionByName = {key=faction} }
-
--- ClubMemberInfo.faction is a PvPFaction (0 = Horde, 1 = Alliance, NeverSecret).
-local function selfFaction()
-	return (UnitFactionGroup("player") == "Alliance") and 1 or 0
-end
-
-local function scanClubRoster()
-	local xfac, factionByName = {}, {}
-	if not C_Club or not C_Club.GetSubscribedClubs or not C_Club.GetClubMembers then
-		return xfac, factionByName
-	end
-	-- Club APIs can fail before clubs are initialized or yield secrets during
-	-- lockdown, so each call is guarded.
-	local ok, clubs = pcall(C_Club.GetSubscribedClubs)
-	if not ok or type(clubs) ~= "table" then
-		return xfac, factionByName
-	end
-	local seenGUID = {}
-	for _, club in ipairs(clubs) do
-		local okMembers, members = pcall(C_Club.GetClubMembers, club.clubId)
-		if okMembers and type(members) == "table" then
-			for _, memberId in ipairs(members) do
-				local okInfo, info = pcall(C_Club.GetMemberInfo, club.clubId, memberId)
-				if okInfo and info and not info.isSelf and info.name and canaccessvalue(info.name) then
-					local key = normalizeUnitName(info.name)
-					if key then
-						factionByName[key] = info.faction -- may be nil
-						if info.faction ~= nil
-							and info.faction ~= selfFaction()
-							and PRESENCE_ONLINE[info.presence]
-							and info.guid
-							and canaccessvalue(info.guid)
-							and not seenGUID[info.guid]
-						then
-							seenGUID[info.guid] = true
-							xfac[#xfac + 1] = fullUnitName(info.name)
-						end
-					end
-				end
-			end
-		end
-	end
-	return xfac, factionByName
-end
-
-local function clubRoster()
-	local now = GetTime()
-	if not rosterMemo.xfac or (now - rosterMemo.at) > C.COMM_ROSTER_MEMO then
-		rosterMemo.xfac, rosterMemo.factionByName = scanClubRoster()
-		rosterMemo.at = now
-	end
-	return rosterMemo
-end
-
---- Online, opposite-faction members of our subscribed clubs — the players we
---- can reach with a cross-faction addon whisper.
--- @return table List of "Name-Realm" strings, deduplicated by GUID.
-function Util.xfacClubMembers()
-	return clubRoster().xfac
-end
-
---- Whether a "Name-Realm" belongs to an opposite-faction member of one of our
---- clubs, per the roster's NeverSecret faction field.
-function Util.isXfacClubMember(unitID)
-	local key = normalizeUnitName(unitID)
-	local faction = key and clubRoster().factionByName[key]
-	return faction ~= nil and faction ~= selfFaction()
 end

@@ -85,14 +85,29 @@ C.GUID_RESOLVE_MEMO = 60
 --
 -- Opposite-faction members of our own WoW communities are reachable by addon
 -- whisper, so every broadcast also fans out to a capped set of them. Whispers
--- are the costliest leg, so the cap is small: confirmed FRP peers and known
--- cross-faction contacts are tried first, and remaining capacity samples the
--- club roster from a rotating offset so coverage spreads across broadcasts.
-C.COMM_RELAY_LIMIT = 6
+-- are the costliest leg, so the cap is deliberately small — a few seeded peers
+-- flood their own faction side, so wide fanout is unnecessary.
+C.COMM_RELAY_LIMIT = 3
 
--- How long (seconds) the scanned club roster (factions + opposite-faction
--- online members) is memoized. Roster scans are O(total club membership).
+-- No single member should act as a relay server: each contact may be used at
+-- most COMM_USAGE_LIMIT times per COMM_USAGE_WINDOW seconds. Exhausted
+-- contacts are only re-used when too few fresh candidates remain — coverage
+-- is never dropped for lack of fresh targets.
+C.COMM_USAGE_LIMIT = 2
+C.COMM_USAGE_WINDOW = 60
+
+-- How long (seconds) the scanned club roster (factions, GUIDs and opposite-
+-- faction online members) is memoized. A stale roster is rebuilt
+-- incrementally — ROSTER_SLICE member lookups per frame — so large
+-- communities never stall a frame.
 C.COMM_ROSTER_MEMO = 45
+C.ROSTER_SLICE = 40
+
+-- Injection into the RP AddOn's register (populating its directory as gossip
+-- arrives) is queued: register writes fire the AddOn's own update/UI events,
+-- so bursts are amortized at INJECT_BURST entries per INJECT_INTERVAL.
+C.INJECT_INTERVAL = 0.5
+C.INJECT_BURST = 2
 
 -- Profiles ------------------------------------------------------------------
 
