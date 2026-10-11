@@ -131,6 +131,17 @@ function Cache:get(guid)
 	return entry
 end
 
+--- Drop every entry regardless of expiry. Testing aid (/frp purge).
+-- @return number Entries dropped.
+function Cache:clear()
+	local n = 0
+	for _ in pairs(self.entries) do
+		n = n + 1
+	end
+	self.entries = {}
+	return n
+end
+
 --- Remove all expired entries. Invoked on a timer; safe to call manually.
 function Cache:sweep()
 	local now = GetTime()

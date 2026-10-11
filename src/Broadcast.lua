@@ -38,6 +38,10 @@ function Broadcast:init()
 	-- directory fills as gossip lands (drained at a bounded rate).
 	self.injectQueue = {} -- [guid] = candidate
 	self.injectOrder = {}
+
+	-- Pinned whisper targets for testing (/frp target), keyed by normalized
+	-- name. Always sent on every fanout, bypassing leg membership and caps.
+	self.forcedTargets = {}
 end
 
 function Broadcast:start()
@@ -98,39 +102,32 @@ function Broadcast:fanOut(chunks, context)
 		end)
 	end
 
-	-- Cross-faction community relays: addon whispers to members of our own
-	-- clubs. Whispers are the costliest leg, so targets are capped at
-	-- COMM_RELAY_LIMIT *and* usage-limited: no single member should act as a
-	-- relay server, so each contact can be used at most COMM_USAGE_LIMIT times
-	-- per COMM_USAGE_WINDOW seconds. A round-robin cursor spreads picks across
-	-- the candidate list (confirmed FRP peers, then known xfac RP contacts,
-	-- then the opposite-faction roster). If too few fresh candidates remain,
-	-- exhausted contacts are used anyway rather than dropping coverage. Blind
-	-- sends are silently discarded by clients without the AddOn.
+	-- Cross-faction relays: addon whispers to members of our own clubs, run as
+	-- two independent legs — communities and, if we are in one, our (possibly
+	-- cross-faction) guild. Each leg has its own capped candidate list with
+	-- the same round-robin cursor and per-contact usage caps (shared across
+	-- legs: a person who is both a guildmate and a community member still has
+	-- one usage budget). See Constants for the limits.
 	local skipName = (srcMedium == "WHISPER" and context.senderName)
 		and ns.Util.normalizeUnitName(context.senderName)
-	local candidates, seen = {}, {}
-	if skipName then
-		seen[skipName] = true
-	end
-	local function addCandidate(name)
-		local key = name and ns.Util.normalizeUnitName(name)
-		if key and not seen[key] then
-			seen[key] = true
-			candidates[#candidates + 1] = { name = name, key = key }
+	local now = GetTime()
+	local sentKeys = {}
+
+	-- Pinned debug targets: guaranteed delivery, bypassing leg membership and
+	-- the caps (the echo-skip still applies — never whisper the source back).
+	-- Debug mode only (/frp debug), so normal users cannot defeat the
+	-- round-robin fairness by pinning.
+	local sentPinned = 0
+	if ns.db and ns.db.debug then
+		for key, name in pairs(self.forcedTargets) do
+			if key ~= skipName and not sentKeys[key] then
+				sentKeys[key] = true
+				comms:sendChunksAddon(chunks, "WHISPER", name)
+				sentPinned = sentPinned + 1
+			end
 		end
 	end
-	for _, unitID in pairs(self.knownRelays) do
-		addCandidate(unitID)
-	end
-	for _, unitID in pairs(self.xfacContacts) do
-		addCandidate(unitID)
-	end
-	for _, name in ipairs(ns.Util.xfacClubMembers()) do
-		addCandidate(name)
-	end
 
-	local now = GetTime()
 	local function usageAt(key)
 		local u = self.commUsage[key]
 		if not u or (now - u.at) > C.COMM_USAGE_WINDOW then
@@ -147,36 +144,80 @@ function Broadcast:fanOut(chunks, context)
 		end
 	end
 
-	local n = #candidates
-	local sent, sentKeys = 0, {}
-	local function trySend(cand)
-		if sent >= C.COMM_RELAY_LIMIT or sentKeys[cand.key] then
-			return
+	-- One leg's selection: confirmed FRP relays and known xfac contacts first
+	-- (filtered to that leg's membership), then the leg's opposite-faction
+	-- roster. A rotating cursor spreads picks across candidates; pass 1 skips
+	-- usage-exhausted contacts, pass 2 fills with them if coverage requires.
+	local function sendLeg(roster, inLeg, limit)
+		local candidates, seen = {}, {}
+		if skipName then
+			seen[skipName] = true
 		end
-		sentKeys[cand.key] = true
-		comms:sendChunksAddon(chunks, "WHISPER", cand.name)
-		bumpUsage(cand.key)
-		sent = sent + 1
-	end
-	if n > 0 then
+		local function add(name)
+			local key = name and ns.Util.normalizeUnitName(name)
+			if key and not seen[key] then
+				seen[key] = true
+				candidates[#candidates + 1] = { name = name, key = key }
+			end
+		end
+		for _, unitID in pairs(self.knownRelays) do
+			if inLeg(unitID) then
+				add(unitID)
+			end
+		end
+		for _, unitID in pairs(self.xfacContacts) do
+			if inLeg(unitID) then
+				add(unitID)
+			end
+		end
+		for _, name in ipairs(roster) do
+			add(name)
+		end
+		local n = #candidates
+		local sent = 0
+		if n == 0 then
+			return 0
+		end
 		self.commCursor = self.commCursor + 1
 		local offset = ((self.commCursor - 1) % n) + 1
+		local function trySend(cand)
+			if sent >= limit or sentKeys[cand.key] then
+				return
+			end
+			sentKeys[cand.key] = true
+			comms:sendChunksAddon(chunks, "WHISPER", cand.name)
+			bumpUsage(cand.key)
+			sent = sent + 1
+		end
 		for pass = 1, 2 do
 			for i = 0, n - 1 do
 				local cand = candidates[((offset + i - 1) % n) + 1]
-				if pass == 1 and usageAt(cand.key) >= C.COMM_USAGE_LIMIT then
-					-- Exhausted this window: defer to the fill pass.
-				else
+				if not (pass == 1 and usageAt(cand.key) >= C.COMM_USAGE_LIMIT) then
 					trySend(cand)
 				end
 			end
-			if sent >= C.COMM_RELAY_LIMIT then
+			if sent >= limit then
 				break
 			end
 		end
+		return sent
 	end
-	if sent > 0 and ns.debugFanout then
-		ns.debugFanout(sent)
+
+	local sentComm = sendLeg(
+		ns.Util.xfacClubMembers(),
+		function(u) return ns.Util.isCommunityClubMember(u) end,
+		C.COMM_RELAY_LIMIT
+	)
+	local sentGuild = 0
+	if IsInGuild() then
+		sentGuild = sendLeg(
+			ns.Util.xfacGuildMembers(),
+			function(u) return ns.Util.isGuildClubMember(u) end,
+			C.GUILD_RELAY_LIMIT
+		)
+	end
+	if (sentComm + sentGuild + sentPinned) > 0 and ns.debugFanout then
+		ns.debugFanout(sentComm, sentGuild, sentPinned)
 	end
 end
 
@@ -328,6 +369,27 @@ function Broadcast:drainInject()
 		end
 		budget = budget - 1
 	end
+end
+
+--- Pin a whisper target for testing: always sent on every fanout, bypassing
+--- leg membership and caps. Returns the normalized "Name-Realm" or nil.
+function Broadcast:forceTarget(unitID)
+	local key = unitID and ns.Util.normalizeUnitName(unitID)
+	local display = key and ns.Util.fullUnitName(unitID)
+	if key and display then
+		self.forcedTargets[key] = display
+		return display
+	end
+end
+
+--- Drop all pinned targets. Returns the number removed.
+function Broadcast:clearForcedTargets()
+	local n = 0
+	for _ in pairs(self.forcedTargets) do
+		n = n + 1
+	end
+	self.forcedTargets = {}
+	return n
 end
 
 --- Record an opposite-faction club member whose profile reached us over the

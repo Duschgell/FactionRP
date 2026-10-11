@@ -89,6 +89,10 @@ C.GUID_RESOLVE_MEMO = 60
 -- flood their own faction side, so wide fanout is unnecessary.
 C.COMM_RELAY_LIMIT = 3
 
+-- The guild is a second, independent whisper leg (cross-faction guilds exist):
+-- its own capped target list on top of the community one.
+C.GUILD_RELAY_LIMIT = 3
+
 -- No single member should act as a relay server: each contact may be used at
 -- most COMM_USAGE_LIMIT times per COMM_USAGE_WINDOW seconds. Exhausted
 -- contacts are only re-used when too few fresh candidates remain — coverage

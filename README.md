@@ -2,7 +2,8 @@
 
 _FactionRP_ is a continuation of the original CrossRP AddOn for World of Warcraft.
 
-It attempts to pull data across faction boundaries by leveraging people's Battle.NET connections.
+It attempts to pull data across faction boundaries by leveraging people's Battle.NET
+connections and cross-faction community/guild whispers.
 The more people are connected and using this AddOn, the more data can be shared.
 
 Unlike CrossRP, the AddOn does not designate people as "servers", but tries to utilize the ingame
@@ -58,13 +59,22 @@ We can also use the same GUID to look up a profile, allowing the AddOn to displa
 
 ### Broadcast Data
 
-Every time we store/refresh a profile in our cache, we will broadcast that data.
-This is done in the following approach:
+We broadcast a profile only when storing it produces NEW or UPDATED content —
+a REFRESHED store (same `CONTENT-VERSION`) extends the TTL but never re-floods.
+Each broadcast fans out over every available leg:
 
-* Scan our battle.net connections and online friends.
-* If they are online, send them a AddOn Battle.NET message (see message structure)
-* The receivers store the data in their own cache and propagate the information further through their own battle.net connections and friends as well as group/raid.
-* They do not send the message to the broadcaster to avoid loops.
+* The hidden same-faction comm channel
+* Battle.NET game-account messages to online WoW friends (cross-faction relays)
+* Group/raid/instance addon messaging, when grouped
+* Addon whispers to a capped set of opposite-faction members of our own
+  communities and guild (see "Community relays")
+* Optionally, regular (non-Battle.NET) online friends — disabled by default
+  (`RELAY_TO_FRIENDS`), redundant with the channel
+
+The receivers store the data in their own cache and propagate the information
+further through the same legs. They do not send the message back toward the
+peer they received it from, and ignore traffic from their own GUID (loop
+avoidance).
 
 ### Message Structure
 
@@ -101,15 +111,16 @@ This section illustrates what happens when a message needs to be broadcast:
 * When not in a party/raid: 
   * Broadcast the data through the AddOn Comm Channel to share with same faction users
   * Broadcast the data through Battle.NET friends
-  * Broadcast the data through friends
-  * Whisper the data to a capped set of opposite-faction members of our own communities
+  * Whisper the data to a capped set of opposite-faction members of our own
+    communities and of our own guild (see "Community relays")
+  * (Disabled by default) Broadcast the data through regular friends
 * when in a part/raid:
   * Same as alone + broadcast through party/raid AddON messaging.
 
 The "AddOn Comm Channel" is a hidden chat channel (joined via `JoinTemporaryChannel`) over which
 same-faction clients exchange addon messages. Cross-faction sharing is possible over
-Battle.NET connections and via addon whispers to opposite-faction community members
-(see below).
+Battle.NET connections and via addon whispers to opposite-faction community and
+guild members (see below).
 
 All chunk sends go through a paced internal queue (`SEND_BURST` messages per
 `SEND_INTERVAL`), and each primitive is additionally routed through **Chomp** —
@@ -126,8 +137,11 @@ join fires channel-list churn that other addons' channel bookkeeping reacts to.
 
 WoW communities cannot carry addon messages directly, but cross-faction *whispers* —
 including addon whispers — work between members of a shared community. Every broadcast
-therefore also whispers up to `COMM_RELAY_LIMIT` opposite-faction members of our own
-subscribed clubs (online only, deduplicated by GUID across clubs). Sends are blind:
+therefore also whispers a capped set of opposite-faction members of our own
+subscribed clubs — run as **two independent legs**: communities (`COMM_RELAY_LIMIT`)
+and our own guild (`GUILD_RELAY_LIMIT`; cross-faction guilds make those members
+whisper-reachable too, and the leg is skipped entirely when guildless). Both legs
+select online members only, deduplicated by GUID across clubs. Sends are blind:
 clients without FactionRP silently discard the message, so the only cost is send-queue
 capacity. Whispers are the costliest leg, hence the small cap — a few seeded peers
 flood their own faction side anyway.
@@ -144,8 +158,10 @@ Candidate order, so the limited slots go to the most promising relays first:
 No single member should act as a relay server, so fairness is enforced two ways:
 a **round-robin cursor** spreads picks across the candidate list rather than always
 starting from the front, and each contact may be used at most `COMM_USAGE_LIMIT`
-times per `COMM_USAGE_WINDOW` seconds. Exhausted contacts are only re-used when too
-few fresh candidates remain — coverage is never dropped for lack of fresh targets.
+times per `COMM_USAGE_WINDOW` seconds — shared across both legs, so a person who is
+both guildmate and community member still has one budget. Exhausted contacts are
+only re-used when too few fresh candidates remain — coverage is never dropped for
+lack of fresh targets.
 
 Club member lists, member factions (`ClubMemberInfo.faction` is `NeverSecret`), and
 presence come from `C_Club`. The roster is rebuilt incrementally (`ROSTER_SLICE`
@@ -153,13 +169,6 @@ member lookups per frame) so large communities never stall a frame, and the same
 memoized roster serves GUID resolution. During chat-messaging lockdown those APIs
 yield secrets, so the leg silently no-ops; whisper sends also fail gracefully
 (`AddOnMessageLockdown`) — see "Security restrictions" below.
-
-### Directory injection
-
-Profiles stored from gossip are also injected into the source RP AddOn's register,
-so its directory/character list populates as data arrives — not only on tooltip.
-Injections drain through a small bounded queue (`INJECT_BURST` per `INJECT_INTERVAL`)
-because register writes fire the AddOn's own update and UI-refresh events.
 
 A message should be ignored when any of the following is true:
 
@@ -169,6 +178,13 @@ A message should be ignored when any of the following is true:
   re-broadcast when the content differs *and* the incoming copy is not older.
 
 When re-broadcasting, we never send the message back toward the peer we received it from.
+
+### Directory injection
+
+Profiles stored from gossip are also injected into the source RP AddOn's register,
+so its directory/character list populates as data arrives — not only on tooltip.
+Injections drain through a small bounded queue (`INJECT_BURST` per `INJECT_INTERVAL`)
+because register writes fire the AddOn's own update and UI-refresh events.
 
 ### Cache Structure
 
@@ -199,9 +215,14 @@ tooltip implementation. Injected entries are treated as transient and respect th
 All commands are available under `/factionrp` or the shorter alias `/frp`.
 Running the base command with no (or an unrecognised) sub-command prints the usage list.
 
-* `/factionrp status` — Show the version, number of cached profiles, the active RP adapter
-  (e.g. TRP3) and whether debug mode is on.
+* `/factionrp status` — Show the version, number of cached profiles, pending
+  re-broadcasts, send-queue depth, known relay/contact counts, the active RP
+  adapter (e.g. TRP3) and whether debug mode is on.
+* `/factionrp purge` — Empty the profile cache (testing).
 * `/factionrp debug` — Toggle debug mode on/off (see below).
+* `/factionrp debug target [Name-Realm]` — Pin a whisper target that bypasses
+  the community/guild selection and caps (testing). `clear` resets; no argument
+  lists pins. Only sends while debug mode is on.
 
 ### Debug Mode
 
@@ -210,8 +231,9 @@ In debug mode, a message is printed out every time the following happens:
 
 * A broadcast is sent, including target GUID
 * A message is received, including sender GUID
-* A profile is stored in the cache
-* A profile is refreshed in the cache
+* A profile is stored or refreshed in the cache
+* A received RP-AddOn profile is queued for re-broadcast, or skipped
+* A fanout sends community/guild/pinned whispers (per-leg counts)
 
 ### Additional Plans
 

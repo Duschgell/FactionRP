@@ -65,12 +65,15 @@ function ns.debugSkip(unitID, reason)
 	ns.Print(("|cffffd200[skip]|r %s (%s)"):format(tostring(unitID), tostring(reason)))
 end
 
---- Log: a fanout sent the given number of cross-faction community whispers.
-function ns.debugFanout(targets)
+--- Log: a fanout sent cross-faction whispers per leg (community, guild) plus
+--- any pinned debug targets.
+function ns.debugFanout(community, guild, pinned)
 	if not enabled() then
 		return
 	end
-	ns.Print("|cffffd200[broadcast]|r community whispers: " .. tostring(targets))
+	ns.Print(("|cffffd200[broadcast]|r whispers: %d community, %d guild, %d pinned"):format(
+		community, guild, pinned or 0
+	))
 end
 
 local function mapSize(t)
@@ -81,15 +84,46 @@ local function mapSize(t)
 	return n
 end
 
--- /factionrp debug ----------------------------------------------------------
+-- /factionrp purge ----------------------------------------------------------
 
-ns.RegisterCommand("debug", function()
+ns.RegisterCommand("purge", function()
+	local n = ns.cache and ns.cache:clear() or 0
+	ns.Print("cache purged (" .. n .. " entries dropped)")
+end, "Empty the profile cache (testing)")
+
+-- /factionrp debug [target] --------------------------------------------------
+
+local function handleTarget(arg)
+	arg = arg and ns.Util.trim(arg) or ""
+	if arg == "" then
+		local names = {}
+		for _, name in pairs(ns.broadcast and ns.broadcast.forcedTargets or {}) do
+			names[#names + 1] = name
+		end
+		ns.Print(#names > 0 and ("pinned targets: " .. table.concat(names, ", ")) or "no pinned targets")
+	elseif arg:lower() == "clear" then
+		local n = ns.broadcast and ns.broadcast:clearForcedTargets() or 0
+		ns.Print("cleared " .. n .. " pinned target(s)")
+	else
+		local name = ns.broadcast and ns.broadcast:forceTarget(arg)
+		ns.Print(name and ("pinned target: " .. name) or ("could not parse name: " .. arg))
+	end
+end
+
+ns.RegisterCommand("debug", function(arg)
 	if not ns.db then
+		return
+	end
+	-- "/frp debug target ..." manages pinned whisper targets; bare "/frp debug"
+	-- toggles debug mode.
+	local sub, rest = arg and arg:match("^(%S*)%s*(.-)$") or "", ""
+	if sub:lower() == "target" then
+		handleTarget(rest)
 		return
 	end
 	ns.db.debug = not ns.db.debug
 	ns.Print("debug mode " .. (ns.db.debug and "|cff33ff66ON|r" or "|cffff5555OFF|r"))
-end, "Toggle verbose debug output")
+end, "Toggle verbose debug output; 'target <name>' pins a whisper test target")
 
 -- Richer status command (overrides the placeholder registered in Core).
 ns.RegisterCommand("status", function()

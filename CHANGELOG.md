@@ -1,5 +1,14 @@
 ﻿# FactionRP Changelog
 
+## 0.2.2
+
+### Added
+
+- Profile broadcasts now also happen over GUILD, via the same rules enforced by Communities broadcasts.
+- Added `/frp purge` to purge cache.
+- Added `/frp debug target` to pin a relay target for testing, i.e `/frp debug target Arru`.
+- Added `/frp debug target clear` to reset the pinned target.
+
 ## 0.2.1
 
 ### Fixed
