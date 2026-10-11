@@ -134,6 +134,25 @@ local function normalizeUnitName(name)
 	end
 	return (char .. "-" .. realm):lower()
 end
+Util.normalizeUnitName = normalizeUnitName
+
+--- Same normalization as normalizeUnitName but preserving case: produces the
+--- "Name-Realm" form suitable for a whisper target.
+local function fullUnitName(name)
+	if not name or name == "" then
+		return nil
+	end
+	local char, realm = name:match("^([^-]+)-?(.*)$")
+	if not char or char == "" then
+		return nil
+	end
+	if not realm or realm == "" then
+		realm = GetNormalizedRealmName() or ""
+	else
+		realm = realm:gsub("%s+", "")
+	end
+	return char .. "-" .. realm
+end
 
 local function guidFromUnits(unitID)
 	for _, token in ipairs(GUID_UNIT_TOKENS) do
@@ -238,4 +257,87 @@ function Util.resolveGUID(unitID)
 
 	guidMemo[key] = { guid = guid or false, expires = now + C.GUID_RESOLVE_MEMO }
 	return guid
+end
+
+-- Community roster ----------------------------------------------------------
+--
+-- Members of our own subscribed WoW communities are the one group of
+-- opposite-faction players we can reach directly: addon whispers work between
+-- community members across factions, and ClubMemberInfo exposes a NeverSecret
+-- `faction` field we can filter on. We cannot see which of them run FactionRP;
+-- the Broadcast layer narrows targets further with traffic-derived signals.
+
+-- ClubMemberPresence values that mean the character is logged in (1 Online,
+-- 4 Away, 5 Busy). OnlineMobile (2) is the phone app and cannot receive addon
+-- messages; Unknown (0) and Offline (3) are useless targets.
+local PRESENCE_ONLINE = { [1] = true, [4] = true, [5] = true }
+
+local rosterMemo = { at = 0 } -- { xfac = {...names}, factionByName = {key=faction} }
+
+-- ClubMemberInfo.faction is a PvPFaction (0 = Horde, 1 = Alliance, NeverSecret).
+local function selfFaction()
+	return (UnitFactionGroup("player") == "Alliance") and 1 or 0
+end
+
+local function scanClubRoster()
+	local xfac, factionByName = {}, {}
+	if not C_Club or not C_Club.GetSubscribedClubs or not C_Club.GetClubMembers then
+		return xfac, factionByName
+	end
+	-- Club APIs can fail before clubs are initialized or yield secrets during
+	-- lockdown, so each call is guarded.
+	local ok, clubs = pcall(C_Club.GetSubscribedClubs)
+	if not ok or type(clubs) ~= "table" then
+		return xfac, factionByName
+	end
+	local seenGUID = {}
+	for _, club in ipairs(clubs) do
+		local okMembers, members = pcall(C_Club.GetClubMembers, club.clubId)
+		if okMembers and type(members) == "table" then
+			for _, memberId in ipairs(members) do
+				local okInfo, info = pcall(C_Club.GetMemberInfo, club.clubId, memberId)
+				if okInfo and info and not info.isSelf and info.name and canaccessvalue(info.name) then
+					local key = normalizeUnitName(info.name)
+					if key then
+						factionByName[key] = info.faction -- may be nil
+						if info.faction ~= nil
+							and info.faction ~= selfFaction()
+							and PRESENCE_ONLINE[info.presence]
+							and info.guid
+							and canaccessvalue(info.guid)
+							and not seenGUID[info.guid]
+						then
+							seenGUID[info.guid] = true
+							xfac[#xfac + 1] = fullUnitName(info.name)
+						end
+					end
+				end
+			end
+		end
+	end
+	return xfac, factionByName
+end
+
+local function clubRoster()
+	local now = GetTime()
+	if not rosterMemo.xfac or (now - rosterMemo.at) > C.COMM_ROSTER_MEMO then
+		rosterMemo.xfac, rosterMemo.factionByName = scanClubRoster()
+		rosterMemo.at = now
+	end
+	return rosterMemo
+end
+
+--- Online, opposite-faction members of our subscribed clubs — the players we
+--- can reach with a cross-faction addon whisper.
+-- @return table List of "Name-Realm" strings, deduplicated by GUID.
+function Util.xfacClubMembers()
+	return clubRoster().xfac
+end
+
+--- Whether a "Name-Realm" belongs to an opposite-faction member of one of our
+--- clubs, per the roster's NeverSecret faction field.
+function Util.isXfacClubMember(unitID)
+	local key = normalizeUnitName(unitID)
+	local faction = key and clubRoster().factionByName[key]
+	return faction ~= nil and faction ~= selfFaction()
 end

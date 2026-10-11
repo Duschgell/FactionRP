@@ -18,6 +18,15 @@ ns.Broadcast = Broadcast
 
 function Broadcast:init()
 	self.playerGUID = nil -- resolved at login
+	-- Cross-faction relay knowledge learned from traffic (session-only),
+	-- keyed by normalized "name-realm":
+	--   knownRelays:  opposite-faction club members confirmed to run FactionRP
+	--                 (we received an FRP whisper from them).
+	--   xfacContacts: opposite-faction club members whose profiles reached us
+	--                 via the RP AddOn's own comms — proven cross-faction
+	--                 reachable RP-AddOn users, though maybe not FRP users.
+	self.knownRelays = {}
+	self.xfacContacts = {}
 end
 
 function Broadcast:start()
@@ -73,6 +82,48 @@ function Broadcast:fanOut(chunks, context)
 			end
 			comms:sendChunksAddon(chunks, "WHISPER", name)
 		end)
+	end
+
+	-- Cross-faction community relays: addon whispers to members of our own
+	-- clubs. Whispers are the costliest leg, so targets are capped at
+	-- COMM_RELAY_LIMIT and ordered: confirmed FRP peers first, then known
+	-- cross-faction RP contacts, then a rotating sample of the remaining
+	-- opposite-faction roster. Blind sends are silently discarded by clients
+	-- without the AddOn, so sampling costs only send-queue slots.
+	local skipName = (srcMedium == "WHISPER" and context.senderName)
+		and ns.Util.normalizeUnitName(context.senderName)
+	local seen = {}
+	if skipName then
+		seen[skipName] = true
+	end
+	local sent = 0
+	local function whisper(name)
+		if sent >= C.COMM_RELAY_LIMIT then
+			return
+		end
+		local key = ns.Util.normalizeUnitName(name)
+		if key and not seen[key] then
+			seen[key] = true
+			comms:sendChunksAddon(chunks, "WHISPER", name)
+			sent = sent + 1
+		end
+	end
+	for _, unitID in pairs(self.knownRelays) do
+		whisper(unitID)
+	end
+	for _, unitID in pairs(self.xfacContacts) do
+		whisper(unitID)
+	end
+	local members = ns.Util.xfacClubMembers()
+	local count = #members
+	if count > 0 then
+		local offset = math.random(count)
+		for i = 0, count - 1 do
+			whisper(members[((offset + i - 1) % count) + 1])
+		end
+	end
+	if sent > 0 and ns.debugFanout then
+		ns.debugFanout(sent)
 	end
 end
 
@@ -136,6 +187,14 @@ function Broadcast:onMessage(raw, context)
 	if msg.sender == self.playerGUID then
 		return
 	end
+	-- A whispered message from an opposite-faction club member confirms they
+	-- run the AddOn and are reachable cross-faction: a known relay.
+	if context.medium == "WHISPER" and context.senderName then
+		local key = ns.Util.normalizeUnitName(context.senderName)
+		if key and ns.Util.isXfacClubMember(context.senderName) then
+			self.knownRelays[key] = context.senderName
+		end
+	end
 	if ns.debugReceive then
 		ns.debugReceive(msg.sender, msg.subject)
 	end
@@ -180,6 +239,17 @@ function Broadcast:onMessage(raw, context)
 		data = msg.data,
 	})
 	self:fanOut(Serializer.chunk(relay), context)
+end
+
+--- Record an opposite-faction club member whose profile reached us over the
+--- RP AddOn's own comm channels. They are proven reachable by cross-faction
+--- whisper and almost certainly run an RP AddOn, so they are preferred relay
+--- targets for the community fanout (see fanOut).
+function Broadcast:noteXfacContact(unitID)
+	local key = unitID and ns.Util.normalizeUnitName(unitID)
+	if key then
+		self.xfacContacts[key] = unitID
+	end
 end
 
 -- Singleton.

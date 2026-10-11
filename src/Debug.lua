@@ -6,8 +6,8 @@
 -- stored or refreshed in the cache.
 --
 -- The logging entry points (ns.debugBroadcast / ns.debugReceive / ns.debugStore /
--- ns.debugReceived / ns.debugSkip) are called from Broadcast and Scanner behind
--- nil-guards, so this module is purely additive.
+-- ns.debugReceived / ns.debugSkip / ns.debugFanout) are called from Broadcast and
+-- Scanner behind nil-guards, so this module is purely additive.
 
 local _, ns = ...
 local C = ns.Const
@@ -65,6 +65,22 @@ function ns.debugSkip(unitID, reason)
 	ns.Print(("|cffffd200[skip]|r %s (%s)"):format(tostring(unitID), tostring(reason)))
 end
 
+--- Log: a fanout sent the given number of cross-faction community whispers.
+function ns.debugFanout(targets)
+	if not enabled() then
+		return
+	end
+	ns.Print("|cffffd200[broadcast]|r community whispers: " .. tostring(targets))
+end
+
+local function mapSize(t)
+	local n = 0
+	for _ in pairs(t) do
+		n = n + 1
+	end
+	return n
+end
+
 -- /factionrp debug ----------------------------------------------------------
 
 ns.RegisterCommand("debug", function()
@@ -78,11 +94,15 @@ end, "Toggle verbose debug output")
 -- Richer status command (overrides the placeholder registered in Core).
 ns.RegisterCommand("status", function()
 	local adapter = ns.getAvailableAdapter()
-	ns.Print(("version %s | cache: %d | pending: %d | send queue: %d | RP adapter: %s | debug: %s"):format(
+	local relays = ns.broadcast and mapSize(ns.broadcast.knownRelays) or 0
+	local contacts = ns.broadcast and mapSize(ns.broadcast.xfacContacts) or 0
+	ns.Print(("version %s | cache: %d | pending: %d | send queue: %d | relays: %d | contacts: %d | RP adapter: %s | debug: %s"):format(
 		C.VERSION,
 		ns.cache and ns.cache:count() or 0,
 		ns.scanner and #ns.scanner.receivedQueue or 0,
 		ns.comms and #ns.comms.queue or 0,
+		relays,
+		contacts,
 		adapter and adapter.name or "|cffff5555none|r",
 		(ns.db and ns.db.debug) and "on" or "off"
 	))

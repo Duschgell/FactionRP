@@ -131,6 +131,13 @@ function Scanner:onAdapterReceived(adapter, unitID)
 		ns.debugReceived(unitID)
 	end
 
+	-- A profile received for an opposite-faction member of one of our clubs
+	-- proves the subject is reachable by cross-faction whisper: record them
+	-- as a preferred community relay target.
+	if ns.Util.isXfacClubMember(unitID) then
+		ns.broadcast:noteXfacContact(unitID)
+	end
+
 	-- Bound the queue; the oldest pending receipts are the least valuable.
 	while #self.receivedQueue > C.RECEIVED_ORIGIN_QUEUE do
 		local dropped = table.remove(self.receivedQueue, 1)

@@ -81,6 +81,19 @@ C.RECEIVED_ORIGIN_QUEUE = 20
 -- bound the cost of Battle.net/club roster scans.
 C.GUID_RESOLVE_MEMO = 60
 
+-- Community relays (cross-faction) ------------------------------------------
+--
+-- Opposite-faction members of our own WoW communities are reachable by addon
+-- whisper, so every broadcast also fans out to a capped set of them. Whispers
+-- are the costliest leg, so the cap is small: confirmed FRP peers and known
+-- cross-faction contacts are tried first, and remaining capacity samples the
+-- club roster from a rotating offset so coverage spreads across broadcasts.
+C.COMM_RELAY_LIMIT = 6
+
+-- How long (seconds) the scanned club roster (factions + opposite-faction
+-- online members) is memoized. Roster scans are O(total club membership).
+C.COMM_ROSTER_MEMO = 45
+
 -- Profiles ------------------------------------------------------------------
 
 -- The profile sections we replicate in v1. These mirror the section keys used
