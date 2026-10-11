@@ -57,16 +57,31 @@ end
 
 -- Build the opaque content-version from the sections' per-section counters.
 -- Missing sections contribute 0. Equality of this string means "same content".
-local function buildContentVersion(sections)
+--
+-- MSP-sourced profiles (non-TRP3 RP addons) lack .v counters; TRP3 instead
+-- tracks per-field CRC versions in profile.mspver. We fold them in as a sorted
+-- suffix so MSP updates still produce a distinct content version.
+local function buildContentVersion(sections, mspver)
 	local function v(section)
 		return (section and section.v) or 0
 	end
-	return string.format(
+	local version = string.format(
 		"%s:%s:%s",
 		v(sections.characteristics),
 		v(sections.character),
 		v(sections.misc)
 	)
+	if mspver then
+		local fields = {}
+		for field, ver in pairs(mspver) do
+			fields[#fields + 1] = tostring(field) .. "=" .. tostring(ver)
+		end
+		if #fields > 0 then
+			table.sort(fields)
+			version = version .. "|msp:" .. table.concat(fields, ",")
+		end
+	end
+	return version
 end
 
 -- Gather the three sections for the LOCAL player via TRP3's exchange getters.
@@ -80,6 +95,8 @@ local function getLocalSections()
 end
 
 -- Gather the three sections for another known unit from TRP3's register.
+-- Also returns the profile's mspver table (nil for non-MSP profiles) so the
+-- caller can fold it into the content version.
 local function getRegisteredSections(unitID)
 	local profile = TRP3_API.register.getUnitIDProfile(unitID)
 	if not profile then
@@ -89,7 +106,7 @@ local function getRegisteredSections(unitID)
 		characteristics = profile.characteristics,
 		character = profile.character,
 		misc = profile.misc,
-	}
+	}, profile.mspver
 end
 
 --- Extract a profile for `unitID` from TRP3's own data, deep-copying so we
@@ -101,7 +118,7 @@ function TRP3Adapter:extract(unitID)
 	end
 	local reg = TRP3_API.register
 
-	local profileID, rawSections
+	local profileID, rawSections, mspver
 	if unitID == TRP3_API.globals.player_id then
 		-- Ourselves: pull from the player profile getters.
 		profileID = TRP3_API.profile.getPlayerCurrentProfileID()
@@ -112,7 +129,7 @@ function TRP3Adapter:extract(unitID)
 			return nil
 		end
 		profileID = reg.getUnitIDProfileID(unitID)
-		rawSections = getRegisteredSections(unitID)
+		rawSections, mspver = getRegisteredSections(unitID)
 	end
 
 	-- Without a profile id we cannot inject on the receiving end, so this
@@ -129,7 +146,7 @@ function TRP3Adapter:extract(unitID)
 
 	return {
 		addon = self.name,
-		contentVersion = buildContentVersion(sections),
+		contentVersion = buildContentVersion(sections, mspver),
 		data = { profileID = profileID, sections = sections },
 	}
 end
@@ -191,6 +208,33 @@ function TRP3Adapter:registerUpdateListener(callback)
 			callback(unitID)
 		end
 	end)
+end
+
+--- Hook TRP3's profile-receipt signals so the Scanner can re-broadcast data
+--- that arrived over TRP3's own comm channels. Two sources:
+---   * REGISTER_DATA_RECEIVED: TRP3 exchange protocol section receipts.
+---   * msp.callback.received: MSP profiles merged from non-TRP3 RP AddOns.
+--- Neither fires for FactionRP's own injections, so this is loop-safe.
+-- @param callback function Invoked as callback(unitID).
+function TRP3Adapter:registerReceivedListener(callback)
+	if not self:isAvailable() then
+		return
+	end
+	if TRP3_Addon and TRP3_Addon.Events and TRP3_Addon.Events.REGISTER_DATA_RECEIVED then
+		TRP3_API.RegisterCallback(TRP3_Addon, TRP3_Addon.Events.REGISTER_DATA_RECEIVED, function(_, unitID)
+			if unitID then
+				callback(unitID)
+			end
+		end)
+	end
+	-- LibMSP exposes a plain callback list on the `msp` global. Our listener is
+	-- appended after TRP3's own (it registers during init, before login), so
+	-- the register writes have already landed when we fire.
+	if msp and msp.callback and msp.callback.received then
+		msp.callback.received[#msp.callback.received + 1] = function(unitID)
+			callback(unitID)
+		end
+	end
 end
 
 -- Register the singleton adapter.
