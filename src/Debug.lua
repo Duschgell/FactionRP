@@ -5,8 +5,9 @@
 -- (with subject GUID), a message received (with sender GUID), and a profile
 -- stored or refreshed in the cache.
 --
--- The logging entry points (ns.debugBroadcast / ns.debugReceive / ns.debugStore)
--- are called from Broadcast behind nil-guards, so this module is purely additive.
+-- The logging entry points (ns.debugBroadcast / ns.debugReceive / ns.debugStore /
+-- ns.debugReceived / ns.debugSkip / ns.debugFanout) are called from Broadcast and
+-- Scanner behind nil-guards, so this module is purely additive.
 
 local _, ns = ...
 local C = ns.Const
@@ -47,6 +48,39 @@ function ns.debugStore(result, guid)
 	-- REJECTED (stale) entries are intentionally not logged to avoid noise.
 end
 
+--- Log: the RP AddOn reported a network-received profile; it was queued for
+--- re-broadcast after the debounce/jitter delay.
+function ns.debugReceived(unitID)
+	if not enabled() then
+		return
+	end
+	ns.Print("|cff66ccff[received]|r profile data for " .. tostring(unitID) .. " (queued)")
+end
+
+--- Log: a pending re-broadcast was skipped (unresolvable GUID, queue drop).
+function ns.debugSkip(unitID, reason)
+	if not enabled() then
+		return
+	end
+	ns.Print(("|cffffd200[skip]|r %s (%s)"):format(tostring(unitID), tostring(reason)))
+end
+
+--- Log: a fanout sent the given number of cross-faction community whispers.
+function ns.debugFanout(targets)
+	if not enabled() then
+		return
+	end
+	ns.Print("|cffffd200[broadcast]|r community whispers: " .. tostring(targets))
+end
+
+local function mapSize(t)
+	local n = 0
+	for _ in pairs(t) do
+		n = n + 1
+	end
+	return n
+end
+
 -- /factionrp debug ----------------------------------------------------------
 
 ns.RegisterCommand("debug", function()
@@ -60,10 +94,16 @@ end, "Toggle verbose debug output")
 -- Richer status command (overrides the placeholder registered in Core).
 ns.RegisterCommand("status", function()
 	local adapter = ns.getAvailableAdapter()
-	ns.Print(("version %s | cache: %d | RP adapter: %s | debug: %s"):format(
+	local relays = ns.broadcast and mapSize(ns.broadcast.knownRelays) or 0
+	local contacts = ns.broadcast and mapSize(ns.broadcast.xfacContacts) or 0
+	ns.Print(("version %s | cache: %d | pending: %d | send queue: %d | relays: %d | contacts: %d | RP adapter: %s | debug: %s"):format(
 		C.VERSION,
 		ns.cache and ns.cache:count() or 0,
+		ns.scanner and #ns.scanner.receivedQueue or 0,
+		ns.comms and #ns.comms.queue or 0,
+		relays,
+		contacts,
 		adapter and adapter.name or "|cffff5555none|r",
 		(ns.db and ns.db.debug) and "on" or "off"
 	))
-end, "Show version, cache size, adapter and debug state")
+end, "Show version, cache size, pending sends, adapter and debug state")

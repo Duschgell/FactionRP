@@ -90,3 +90,278 @@ function Util.isOppositeFaction(unit)
 	-- mismatch between two known, differing groups as opposite faction.
 	return theirs ~= nil and mine ~= nil and theirs ~= mine
 end
+
+-- GUID resolution -----------------------------------------------------------
+--
+-- The wire format and cache key profiles by the subject's real GUID, but
+-- profiles received over the RP AddOn's comm channels arrive keyed only by
+-- "Name-Realm". resolveGUID is a best-effort, name-based lookup over every
+-- source that can map a character name to a GUID: nearby unit tokens,
+-- Battle.net friends, and WoW community/club rosters.
+
+-- Unit tokens that can refer to other players near enough to have a GUID.
+local GUID_UNIT_TOKENS = { "target", "targettarget", "mouseover", "focus", "softenemy" }
+for i = 1, MAX_PARTY_MEMBERS or 4 do
+	GUID_UNIT_TOKENS[#GUID_UNIT_TOKENS + 1] = "party" .. i
+end
+for i = 1, MAX_RAID_MEMBERS or 40 do
+	GUID_UNIT_TOKENS[#GUID_UNIT_TOKENS + 1] = "raid" .. i
+end
+for i = 1, 40 do
+	GUID_UNIT_TOKENS[#GUID_UNIT_TOKENS + 1] = "nameplate" .. i
+end
+for i = 1, 5 do
+	GUID_UNIT_TOKENS[#GUID_UNIT_TOKENS + 1] = "arena" .. i
+end
+
+--- Normalize a character name to "Name-Realm" for comparison: strips spaces
+-- from the realm (matching getUnitID) and defaults a missing realm to the
+-- local realm.
+-- @param name string "Name" or "Name-Realm".
+-- @return string|nil
+local function normalizeUnitName(name)
+	if not name or name == "" then
+		return nil
+	end
+	local char, realm = name:match("^([^-]+)-?(.*)$")
+	if not char or char == "" then
+		return nil
+	end
+	if not realm or realm == "" then
+		realm = GetNormalizedRealmName() or ""
+	else
+		realm = realm:gsub("%s+", "")
+	end
+	return (char .. "-" .. realm):lower()
+end
+Util.normalizeUnitName = normalizeUnitName
+
+--- Same normalization as normalizeUnitName but preserving case: produces the
+--- "Name-Realm" form suitable for a whisper target.
+local function fullUnitName(name)
+	if not name or name == "" then
+		return nil
+	end
+	local char, realm = name:match("^([^-]+)-?(.*)$")
+	if not char or char == "" then
+		return nil
+	end
+	if not realm or realm == "" then
+		realm = GetNormalizedRealmName() or ""
+	else
+		realm = realm:gsub("%s+", "")
+	end
+	return char .. "-" .. realm
+end
+
+-- Community roster ----------------------------------------------------------
+--
+-- Members of our own subscribed WoW communities are the one group of
+-- opposite-faction players we can reach directly: addon whispers work between
+-- community members across factions, and ClubMemberInfo exposes a NeverSecret
+-- `faction` field we can filter on. The roster also doubles as the name->GUID
+-- map for resolveGUID's club fallback.
+--
+-- A full scan is O(total club membership) — too much for one frame on large
+-- communities — so a stale roster is rebuilt incrementally: ROSTER_SLICE
+-- member lookups per frame via self-rescheduling timers, then the memo is
+-- swapped atomically. Callers always see the last complete roster (possibly
+-- stale or, before the first build finishes, empty); lookups during a build
+-- degrade to graceful misses.
+
+-- ClubMemberPresence values that mean the character is logged in (1 Online,
+-- 4 Away, 5 Busy). OnlineMobile (2) is the phone app and cannot receive addon
+-- messages; Unknown (0) and Offline (3) are useless targets.
+local PRESENCE_ONLINE = { [1] = true, [4] = true, [5] = true }
+
+local rosterMemo = { at = 0, xfac = {}, factionByName = {}, guidByName = {} }
+local rosterBuild = nil -- incremental build state, or nil when idle
+
+-- ClubMemberInfo.faction is a PvPFaction (0 = Horde, 1 = Alliance, NeverSecret).
+local function selfFaction()
+	return (UnitFactionGroup("player") == "Alliance") and 1 or 0
+end
+
+local function finishRosterBuild(build)
+	rosterMemo.xfac = build.xfac
+	rosterMemo.factionByName = build.factionByName
+	rosterMemo.guidByName = build.guidByName
+	rosterMemo.at = GetTime()
+	rosterBuild = nil
+end
+
+-- Process up to ROSTER_SLICE member lookups, then reschedule for the next
+-- frame. On completion the accumulated tables replace the memo atomically.
+local function stepRosterBuild(build)
+	if build ~= rosterBuild then
+		return -- superseded
+	end
+	local budget = C.ROSTER_SLICE
+	while budget > 0 do
+		local club = build.clubs[build.c]
+		if not club then
+			finishRosterBuild(build)
+			return
+		end
+		if not build.members then
+			local ok, members = pcall(C_Club.GetClubMembers, club.clubId)
+			build.members = (ok and type(members) == "table") and members or {}
+			build.m = 1
+		end
+		local memberId = build.members[build.m]
+		if not memberId then
+			build.members = nil
+			build.c = build.c + 1
+		else
+			build.m = build.m + 1
+			budget = budget - 1
+			-- Club APIs can fail before init or yield secrets during lockdown.
+			local okInfo, info = pcall(C_Club.GetMemberInfo, club.clubId, memberId)
+			if okInfo and info and not info.isSelf and info.name and canaccessvalue(info.name) then
+				local key = normalizeUnitName(info.name)
+				if key then
+					build.factionByName[key] = info.faction -- may be nil
+					if info.guid and canaccessvalue(info.guid) then
+						build.guidByName[key] = info.guid
+						if info.faction ~= nil
+							and info.faction ~= selfFaction()
+							and PRESENCE_ONLINE[info.presence]
+							and not build.seenGUID[info.guid]
+						then
+							build.seenGUID[info.guid] = true
+							build.xfac[#build.xfac + 1] = fullUnitName(info.name)
+						end
+					end
+				end
+			end
+		end
+	end
+	C_Timer.After(0, function()
+		stepRosterBuild(build)
+	end)
+end
+
+local function startRosterBuild()
+	if not C_Club or not C_Club.GetSubscribedClubs or not C_Club.GetClubMembers then
+		return
+	end
+	-- Club APIs can fail before clubs are initialized or during lockdown.
+	local ok, clubs = pcall(C_Club.GetSubscribedClubs)
+	if not ok or type(clubs) ~= "table" then
+		return
+	end
+	rosterBuild = {
+		clubs = clubs, c = 1, m = 1, members = nil,
+		xfac = {}, factionByName = {}, guidByName = {}, seenGUID = {},
+	}
+	stepRosterBuild(rosterBuild)
+end
+
+local function clubRoster()
+	if not rosterBuild and (GetTime() - rosterMemo.at) > C.COMM_ROSTER_MEMO then
+		startRosterBuild()
+	end
+	return rosterMemo
+end
+
+--- Online, opposite-faction members of our subscribed clubs — the players we
+--- can reach with a cross-faction addon whisper.
+-- @return table List of "Name-Realm" strings, deduplicated by GUID.
+function Util.xfacClubMembers()
+	return clubRoster().xfac
+end
+
+--- Whether a "Name-Realm" belongs to an opposite-faction member of one of our
+--- clubs, per the roster's NeverSecret faction field.
+function Util.isXfacClubMember(unitID)
+	local key = normalizeUnitName(unitID)
+	local faction = key and clubRoster().factionByName[key]
+	return faction ~= nil and faction ~= selfFaction()
+end
+
+local function guidFromUnits(unitID)
+	for _, token in ipairs(GUID_UNIT_TOKENS) do
+		-- Unit APIs may yield secret values during lockdown; skip those.
+		local ok, guid = pcall(UnitGUID, token)
+		if ok and guid and not issecretvalue(guid) then
+			local okID, id = pcall(Util.getUnitID, token)
+			if okID and id and id:lower() == unitID then
+				return guid
+			end
+		end
+	end
+end
+
+local function guidFromBNetFriends(unitID)
+	if BNFeaturesEnabledAndConnected and not BNFeaturesEnabledAndConnected() then
+		return
+	end
+	if not C_BattleNet then
+		return
+	end
+	local numFriends = BNGetNumFriends() or 0
+	for i = 1, numFriends do
+		local numAccounts = C_BattleNet.GetFriendNumGameAccounts(i) or 0
+		for j = 1, numAccounts do
+			local acct = C_BattleNet.GetFriendGameAccountInfo(i, j)
+			if acct
+				and acct.clientProgram == BNET_CLIENT_WOW
+				and acct.characterName
+				and acct.realmName
+				and acct.playerGuid
+				and normalizeUnitName(acct.characterName .. "-" .. acct.realmName) == unitID
+			then
+				return acct.playerGuid
+			end
+		end
+	end
+end
+
+local function guidFromClubs(unitID)
+	-- Shares the (memoized, incrementally-built) community roster rather than
+	-- walking every club member itself.
+	return clubRoster().guidByName[unitID]
+end
+
+local guidMemo = {} -- [lowered unitID] = { guid = guid|false, expires = GetTime() }
+local memoPruneCounter = 0
+
+--- Best-effort resolution of a "Name-Realm" unitID to a real player GUID.
+-- Results (including misses) are memoized for C.GUID_RESOLVE_MEMO seconds.
+-- @param unitID string "Name-Realm".
+-- @return string|nil The GUID, or nil if it cannot be resolved.
+function Util.resolveGUID(unitID)
+	if not unitID then
+		return nil
+	end
+	local key = unitID:lower()
+	local now = GetTime()
+	local memo = guidMemo[key]
+	if memo and memo.expires > now then
+		return memo.guid or nil
+	end
+
+	local guid = guidFromUnits(key)
+		or guidFromBNetFriends(key)
+		or guidFromClubs(key)
+
+	-- Periodically prune expired memos so the table cannot grow unbounded
+	-- over a long session.
+	memoPruneCounter = memoPruneCounter + 1
+	if memoPruneCounter >= 50 then
+		memoPruneCounter = 0
+		for k, m in pairs(guidMemo) do
+			if m.expires <= now then
+				guidMemo[k] = nil
+			end
+		end
+	end
+
+	if not guid and rosterBuild then
+		-- The roster is mid-rebuild: this miss may resolve once it finishes,
+		-- so do not memoize it as a negative result.
+		return nil
+	end
+	guidMemo[key] = { guid = guid or false, expires = now + C.GUID_RESOLVE_MEMO }
+	return guid
+end

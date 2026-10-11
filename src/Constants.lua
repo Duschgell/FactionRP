@@ -57,6 +57,58 @@ C.CACHE_TTL = 300
 -- How often (seconds) the cache sweeps and removes expired entries.
 C.CACHE_SWEEP_INTERVAL = 60
 
+-- Received-profile re-broadcast ---------------------------------------------
+--
+-- When the RP AddOn reports profile data arriving over its own comm channels
+-- (see ProfileAdapter:registerReceivedListener), the Scanner re-broadcasts it
+-- through the normal originate pipeline. These values bound how much extra
+-- traffic that trigger can produce:
+--
+-- Receipts arrive as several per-section messages; we coalesce them by waiting
+-- RECEIVED_DEBOUNCE seconds after the last one. A further random delay of up to
+-- RECEIVED_JITTER seconds staggers simultaneous originators so the first peer
+-- copy to reach us suppresses ours via the cache's REFRESHED path.
+C.RECEIVED_DEBOUNCE = 1.5
+C.RECEIVED_JITTER = 4
+
+-- Received-trigger broadcasts drain through a bounded pending queue: at most
+-- one is fired per RECEIVED_ORIGIN_INTERVAL seconds, and the queue holds at
+-- most RECEIVED_ORIGIN_QUEUE entries (the oldest are dropped on overflow).
+C.RECEIVED_ORIGIN_INTERVAL = 5
+C.RECEIVED_ORIGIN_QUEUE = 20
+
+-- How long (seconds) a GUID-resolution result for a unitID is memoized, to
+-- bound the cost of Battle.net/club roster scans.
+C.GUID_RESOLVE_MEMO = 60
+
+-- Community relays (cross-faction) ------------------------------------------
+--
+-- Opposite-faction members of our own WoW communities are reachable by addon
+-- whisper, so every broadcast also fans out to a capped set of them. Whispers
+-- are the costliest leg, so the cap is deliberately small — a few seeded peers
+-- flood their own faction side, so wide fanout is unnecessary.
+C.COMM_RELAY_LIMIT = 3
+
+-- No single member should act as a relay server: each contact may be used at
+-- most COMM_USAGE_LIMIT times per COMM_USAGE_WINDOW seconds. Exhausted
+-- contacts are only re-used when too few fresh candidates remain — coverage
+-- is never dropped for lack of fresh targets.
+C.COMM_USAGE_LIMIT = 2
+C.COMM_USAGE_WINDOW = 60
+
+-- How long (seconds) the scanned club roster (factions, GUIDs and opposite-
+-- faction online members) is memoized. A stale roster is rebuilt
+-- incrementally — ROSTER_SLICE member lookups per frame — so large
+-- communities never stall a frame.
+C.COMM_ROSTER_MEMO = 45
+C.ROSTER_SLICE = 40
+
+-- Injection into the RP AddOn's register (populating its directory as gossip
+-- arrives) is queued: register writes fire the AddOn's own update/UI events,
+-- so bursts are amortized at INJECT_BURST entries per INJECT_INTERVAL.
+C.INJECT_INTERVAL = 0.5
+C.INJECT_BURST = 2
+
 -- Profiles ------------------------------------------------------------------
 
 -- The profile sections we replicate in v1. These mirror the section keys used

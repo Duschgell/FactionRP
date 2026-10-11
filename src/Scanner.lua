@@ -10,6 +10,7 @@
 -- originate when the data actually lands.
 
 local _, ns = ...
+local C = ns.Const
 
 local Scanner = ns.Class("Scanner")
 ns.Scanner = Scanner
@@ -19,13 +20,24 @@ function Scanner:init()
 	-- [unitID] = guid. Only ever holds same-faction units; self is handled
 	-- explicitly via the adapter's player unit id.
 	self.selected = {}
+
+	-- Profiles reported as received over the RP AddOn's own comm channels,
+	-- queued for re-broadcast. receivedPending maps unitID -> { adapter,
+	-- readyAt }; receivedQueue is the FIFO order, capped so sustained receipt
+	-- bursts cannot flood the send queue.
+	self.receivedPending = {}
+	self.receivedQueue = {}
 end
 
 function Scanner:start()
-	-- React when an adapter reports a profile changed/arrived.
+	-- React when an adapter reports a profile changed/arrived, or profile
+	-- data was received over the AddOn's own comm channels.
 	for _, adapter in pairs(ns.adapters) do
 		adapter:registerUpdateListener(function(unitID)
 			self:onAdapterUpdate(adapter, unitID)
+		end)
+		adapter:registerReceivedListener(function(unitID)
+			self:onAdapterReceived(adapter, unitID)
 		end)
 	end
 
@@ -39,6 +51,12 @@ function Scanner:start()
 	-- Share our own profile as soon as possible (and again whenever we edit it,
 	-- via onAdapterUpdate's self handling).
 	self:shareSelf()
+
+	-- Drain received-profile re-broadcasts at a bounded rate so this trigger
+	-- cannot, on its own, overwhelm the paced send queue.
+	C_Timer.NewTicker(C.RECEIVED_ORIGIN_INTERVAL, function()
+		self:drainReceived()
+	end)
 end
 
 --- Attempt to broadcast the local player's own profile.
@@ -87,6 +105,74 @@ function Scanner:onAdapterUpdate(adapter, unitID)
 	end
 	if guid then
 		self:share(adapter, unitID, guid)
+	end
+end
+
+--- Handle an adapter's "profile data received over the network" signal.
+-- Receipts fire per section while data is still landing, so rather than
+-- sharing immediately we queue the unit with a jittered ready time: this
+-- collapses the burst into one broadcast AND staggers simultaneous
+-- originators, letting the first peer copy to reach us suppress ours.
+function Scanner:onAdapterReceived(adapter, unitID)
+	if not unitID or unitID == adapter:getPlayerUnitID() then
+		return -- never re-broadcast ourselves
+	end
+
+	local readyAt = GetTime() + C.RECEIVED_DEBOUNCE + math.random() * C.RECEIVED_JITTER
+	if self.receivedPending[unitID] then
+		-- Re-arm on each section receipt.
+		self.receivedPending[unitID].readyAt = readyAt
+		return
+	end
+
+	self.receivedPending[unitID] = { adapter = adapter, readyAt = readyAt }
+	self.receivedQueue[#self.receivedQueue + 1] = unitID
+	if ns.debugReceived then
+		ns.debugReceived(unitID)
+	end
+
+	-- A profile received for an opposite-faction member of one of our clubs
+	-- proves the subject is reachable by cross-faction whisper: record them
+	-- as a preferred community relay target.
+	if ns.Util.isXfacClubMember(unitID) then
+		ns.broadcast:noteXfacContact(unitID)
+	end
+
+	-- Bound the queue; the oldest pending receipts are the least valuable.
+	while #self.receivedQueue > C.RECEIVED_ORIGIN_QUEUE do
+		local dropped = table.remove(self.receivedQueue, 1)
+		self.receivedPending[dropped] = nil
+		if ns.debugSkip then
+			ns.debugSkip(dropped, "received queue full")
+		end
+	end
+end
+
+--- Fire at most one ready received-profile broadcast per tick.
+function Scanner:drainReceived()
+	local now = GetTime()
+	local i = 1
+	while i <= #self.receivedQueue do
+		local unitID = self.receivedQueue[i]
+		local pending = self.receivedPending[unitID]
+		if not pending then
+			-- Stale queue entry (shouldn't happen); drop it.
+			table.remove(self.receivedQueue, i)
+		elseif pending.readyAt <= now then
+			table.remove(self.receivedQueue, i)
+			self.receivedPending[unitID] = nil
+
+			local adapter = pending.adapter
+			local guid = adapter and adapter:isAvailable() and ns.Util.resolveGUID(unitID)
+			if guid then
+				self:share(adapter, unitID, guid)
+			elseif ns.debugSkip then
+				ns.debugSkip(unitID, "could not resolve GUID")
+			end
+			return -- at most one per tick
+		else
+			i = i + 1
+		end
 	end
 end
 

@@ -32,6 +32,14 @@ When a player is "selected", their profile is extracted and stored in the intern
 database of the AddOn. A player is considered "selected" when the mouse hovers over someone,
 or someone is selected as target.
 
+A player is also "selected" indirectly: whenever the RP AddOn itself receives profile
+data over its own comm channels -- like TRP3's exchange protocol, or MSP for non-TRP3 AddOn --
+that profile is treated like a selection and re-broadcast through the network. Because
+receipts arrive per profile section, they are coalesced with a short debounce plus a
+random jitter (so many clients receiving the same profile don't all flood at once —
+the first copy to arrive suppresses the rest), and re-broadcasts drain at a bounded
+rate through a capped queue, so busy environments cannot overwhelm the comm throttle.
+
 ### Extract Profile
 
 A player's profile will be extracted from the supported AddOns. (Initially TRP3)
@@ -84,12 +92,53 @@ This section illustrates what happens when a message needs to be broadcast:
   * Broadcast the data through the AddOn Comm Channel to share with same faction users
   * Broadcast the data through Battle.NET friends
   * Broadcast the data through friends
+  * Whisper the data to a capped set of opposite-faction members of our own communities
 * when in a part/raid:
   * Same as alone + broadcast through party/raid AddON messaging.
 
 The "AddOn Comm Channel" is a hidden chat channel (joined via `JoinTemporaryChannel`) over which
-same-faction clients exchange addon messages. Cross-faction sharing is only possible over the
-Battle.NET connections.
+same-faction clients exchange addon messages. Cross-faction sharing is possible over
+Battle.NET connections and via addon whispers to opposite-faction community members
+(see below).
+
+### Community relays
+
+WoW communities cannot carry addon messages directly, but cross-faction *whispers* —
+including addon whispers — work between members of a shared community. Every broadcast
+therefore also whispers up to `COMM_RELAY_LIMIT` opposite-faction members of our own
+subscribed clubs (online only, deduplicated by GUID across clubs). Sends are blind:
+clients without FactionRP silently discard the message, so the only cost is send-queue
+capacity. Whispers are the costliest leg, hence the small cap — a few seeded peers
+flood their own faction side anyway.
+
+Candidate order, so the limited slots go to the most promising relays first:
+
+1. **Confirmed FRP peers** — an opposite-faction club member we have already received
+   an FactionRP whisper from this session provably runs the AddOn.
+2. **Known cross-faction contacts** — opposite-faction club members whose profiles
+   reached us via the RP AddOn's own comms (e.g. a TRP3 profile arriving cross-faction
+   through the community): proven reachable, almost certainly RP-AddOn users.
+3. **The remaining opposite-faction roster.**
+
+No single member should act as a relay server, so fairness is enforced two ways:
+a **round-robin cursor** spreads picks across the candidate list rather than always
+starting from the front, and each contact may be used at most `COMM_USAGE_LIMIT`
+times per `COMM_USAGE_WINDOW` seconds. Exhausted contacts are only re-used when too
+few fresh candidates remain — coverage is never dropped for lack of fresh targets.
+
+Club member lists, member factions (`ClubMemberInfo.faction` is `NeverSecret`), and
+presence come from `C_Club`. The roster is rebuilt incrementally (`ROSTER_SLICE`
+member lookups per frame) so large communities never stall a frame, and the same
+memoized roster serves GUID resolution. During chat-messaging lockdown those APIs
+yield secrets, so the leg silently no-ops; whisper sends also fail gracefully
+(`AddOnMessageLockdown`) — see "Security restrictions" below.
+
+### Directory injection
+
+Profiles stored from gossip are also injected into the source RP AddOn's register,
+so its directory/character list populates as data arrives — not only on tooltip.
+Injections drain through a small bounded queue (`INJECT_BURST` per `INJECT_INTERVAL`)
+because register writes fire the AddOn's own update and UI-refresh events.
 
 A message should be ignored when any of the following is true:
 
