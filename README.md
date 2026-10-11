@@ -108,22 +108,37 @@ including addon whispers — work between members of a shared community. Every b
 therefore also whispers up to `COMM_RELAY_LIMIT` opposite-faction members of our own
 subscribed clubs (online only, deduplicated by GUID across clubs). Sends are blind:
 clients without FactionRP silently discard the message, so the only cost is send-queue
-capacity. Whispers are the costliest leg, hence the small cap.
+capacity. Whispers are the costliest leg, hence the small cap — a few seeded peers
+flood their own faction side anyway.
 
-Target order, so the limited slots go to the most promising relays first:
+Candidate order, so the limited slots go to the most promising relays first:
 
 1. **Confirmed FRP peers** — an opposite-faction club member we have already received
    an FactionRP whisper from this session provably runs the AddOn.
 2. **Known cross-faction contacts** — opposite-faction club members whose profiles
    reached us via the RP AddOn's own comms (e.g. a TRP3 profile arriving cross-faction
    through the community): proven reachable, almost certainly RP-AddOn users.
-3. **A rotating sample** of the remaining opposite-faction roster, so coverage spreads
-   across broadcasts rather than always hitting the same members.
+3. **The remaining opposite-faction roster.**
+
+No single member should act as a relay server, so fairness is enforced two ways:
+a **round-robin cursor** spreads picks across the candidate list rather than always
+starting from the front, and each contact may be used at most `COMM_USAGE_LIMIT`
+times per `COMM_USAGE_WINDOW` seconds. Exhausted contacts are only re-used when too
+few fresh candidates remain — coverage is never dropped for lack of fresh targets.
 
 Club member lists, member factions (`ClubMemberInfo.faction` is `NeverSecret`), and
-presence come from `C_Club`. During chat-messaging lockdown those APIs yield secrets,
-so the leg silently no-ops; whisper sends also fail gracefully
+presence come from `C_Club`. The roster is rebuilt incrementally (`ROSTER_SLICE`
+member lookups per frame) so large communities never stall a frame, and the same
+memoized roster serves GUID resolution. During chat-messaging lockdown those APIs
+yield secrets, so the leg silently no-ops; whisper sends also fail gracefully
 (`AddOnMessageLockdown`) — see "Security restrictions" below.
+
+### Directory injection
+
+Profiles stored from gossip are also injected into the source RP AddOn's register,
+so its directory/character list populates as data arrives — not only on tooltip.
+Injections drain through a small bounded queue (`INJECT_BURST` per `INJECT_INTERVAL`)
+because register writes fire the AddOn's own update and UI-refresh events.
 
 A message should be ignored when any of the following is true:
 
