@@ -90,3 +90,152 @@ function Util.isOppositeFaction(unit)
 	-- mismatch between two known, differing groups as opposite faction.
 	return theirs ~= nil and mine ~= nil and theirs ~= mine
 end
+
+-- GUID resolution -----------------------------------------------------------
+--
+-- The wire format and cache key profiles by the subject's real GUID, but
+-- profiles received over the RP AddOn's comm channels arrive keyed only by
+-- "Name-Realm". resolveGUID is a best-effort, name-based lookup over every
+-- source that can map a character name to a GUID: nearby unit tokens,
+-- Battle.net friends, and WoW community/club rosters.
+
+-- Unit tokens that can refer to other players near enough to have a GUID.
+local GUID_UNIT_TOKENS = { "target", "targettarget", "mouseover", "focus", "softenemy" }
+for i = 1, MAX_PARTY_MEMBERS or 4 do
+	GUID_UNIT_TOKENS[#GUID_UNIT_TOKENS + 1] = "party" .. i
+end
+for i = 1, MAX_RAID_MEMBERS or 40 do
+	GUID_UNIT_TOKENS[#GUID_UNIT_TOKENS + 1] = "raid" .. i
+end
+for i = 1, 40 do
+	GUID_UNIT_TOKENS[#GUID_UNIT_TOKENS + 1] = "nameplate" .. i
+end
+for i = 1, 5 do
+	GUID_UNIT_TOKENS[#GUID_UNIT_TOKENS + 1] = "arena" .. i
+end
+
+--- Normalize a character name to "Name-Realm" for comparison: strips spaces
+-- from the realm (matching getUnitID) and defaults a missing realm to the
+-- local realm.
+-- @param name string "Name" or "Name-Realm".
+-- @return string|nil
+local function normalizeUnitName(name)
+	if not name or name == "" then
+		return nil
+	end
+	local char, realm = name:match("^([^-]+)-?(.*)$")
+	if not char or char == "" then
+		return nil
+	end
+	if not realm or realm == "" then
+		realm = GetNormalizedRealmName() or ""
+	else
+		realm = realm:gsub("%s+", "")
+	end
+	return (char .. "-" .. realm):lower()
+end
+
+local function guidFromUnits(unitID)
+	for _, token in ipairs(GUID_UNIT_TOKENS) do
+		-- Unit APIs may yield secret values during lockdown; skip those.
+		local ok, guid = pcall(UnitGUID, token)
+		if ok and guid and not issecretvalue(guid) then
+			local okID, id = pcall(Util.getUnitID, token)
+			if okID and id and id:lower() == unitID then
+				return guid
+			end
+		end
+	end
+end
+
+local function guidFromBNetFriends(unitID)
+	if BNFeaturesEnabledAndConnected and not BNFeaturesEnabledAndConnected() then
+		return
+	end
+	if not C_BattleNet then
+		return
+	end
+	local numFriends = BNGetNumFriends() or 0
+	for i = 1, numFriends do
+		local numAccounts = C_BattleNet.GetFriendNumGameAccounts(i) or 0
+		for j = 1, numAccounts do
+			local acct = C_BattleNet.GetFriendGameAccountInfo(i, j)
+			if acct
+				and acct.clientProgram == BNET_CLIENT_WOW
+				and acct.characterName
+				and acct.realmName
+				and acct.playerGuid
+				and normalizeUnitName(acct.characterName .. "-" .. acct.realmName) == unitID
+			then
+				return acct.playerGuid
+			end
+		end
+	end
+end
+
+local function guidFromClubs(unitID)
+	if not C_Club or not C_Club.GetSubscribedClubs or not C_Club.GetClubMembers then
+		return
+	end
+	-- Club APIs can fail before clubs are initialized or yield secrets during
+	-- lockdown, so each call is guarded.
+	local ok, clubs = pcall(C_Club.GetSubscribedClubs)
+	if not ok or type(clubs) ~= "table" then
+		return
+	end
+	for _, club in ipairs(clubs) do
+		local okMembers, members = pcall(C_Club.GetClubMembers, club.clubId)
+		if okMembers and type(members) == "table" then
+			for _, memberId in ipairs(members) do
+				local okInfo, info = pcall(C_Club.GetMemberInfo, club.clubId, memberId)
+				if okInfo
+					and info
+					and info.guid
+					and canaccessvalue(info.guid)
+					and info.name
+					and normalizeUnitName(info.name) == unitID
+				then
+					return info.guid
+				end
+			end
+		end
+	end
+end
+
+local guidMemo = {} -- [lowered unitID] = { guid = guid|false, expires = GetTime() }
+local memoPruneCounter = 0
+
+--- Best-effort resolution of a "Name-Realm" unitID to a real player GUID.
+-- Results (including misses) are memoized for C.GUID_RESOLVE_MEMO seconds.
+-- @param unitID string "Name-Realm".
+-- @return string|nil The GUID, or nil if it cannot be resolved.
+function Util.resolveGUID(unitID)
+	if not unitID then
+		return nil
+	end
+	local key = unitID:lower()
+	local now = GetTime()
+	local memo = guidMemo[key]
+	if memo and memo.expires > now then
+		return memo.guid or nil
+	end
+
+	local guid = guidFromUnits(key)
+		or guidFromBNetFriends(key)
+		or guidFromClubs(key)
+
+	-- Periodically prune expired memos so the table cannot grow unbounded
+	-- over a long session.
+	memoPruneCounter = memoPruneCounter + 1
+	if memoPruneCounter >= 50 then
+		memoPruneCounter = 0
+		for k, m in pairs(guidMemo) do
+			if m.expires <= now then
+				guidMemo[k] = nil
+			end
+		end
+	end
+
+	guidMemo[key] = { guid = guid or false, expires = now + C.GUID_RESOLVE_MEMO }
+	return guid
+end
