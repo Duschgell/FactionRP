@@ -40,6 +40,16 @@ random jitter (so many clients receiving the same profile don't all flood at onc
 the first copy to arrive suppresses the rest), and re-broadcasts drain at a bounded
 rate through a capped queue, so busy environments cannot overwhelm the comm throttle.
 
+Feedback from our own traffic is deliberately ignored: profiles we push into the RP
+AddOn's register (directory injection and tooltip enrichment) fire the same
+"profile updated" signals as real data. Re-originating on those would form a loop
+(one received profile ⇒ inject ⇒ update event ⇒ re-broadcast ⇒ peers inject again),
+which was the root cause of duplicated TRP3 map-scan results (issue #1). The
+Scanner therefore only re-originates for units the user actually selected this
+session (mouseover/target, or ourselves), and skips a share whose content version
+is unchanged since our last originate (`lastSharedVersion` bookkeeping in
+`Scanner.lua`).
+
 ### Extract Profile
 
 A player's profile will be extracted from the supported AddOns. (Initially TRP3)
@@ -100,6 +110,17 @@ The "AddOn Comm Channel" is a hidden chat channel (joined via `JoinTemporaryChan
 same-faction clients exchange addon messages. Cross-faction sharing is possible over
 Battle.NET connections and via addon whispers to opposite-faction community members
 (see below).
+
+All chunk sends go through a paced internal queue (`SEND_BURST` messages per
+`SEND_INTERVAL`), and each primitive is additionally routed through **Chomp** —
+the ChatThrottleLib wrapper TRP3 already ships — on the `LOW` priority queue,
+falling back to the raw `C_ChatInfo.SendAddonMessage` / `BNSendGameData` calls
+when Chomp is unavailable. This coalesces our bulk gossip traffic into the same
+global throttle queues every addon shares, so FactionRP cannot starve another
+addon's sends (notably TRP3's unthrottled map-scan `C_SCAN` requests, which are
+sensitive to chat-frame send backoff — see issue #1). The comm channel join is
+also idempotent: it is skipped when we are already in the channel, since every
+join fires channel-list churn that other addons' channel bookkeeping reacts to.
 
 ### Community relays
 

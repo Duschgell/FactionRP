@@ -8,6 +8,18 @@
 -- Because the RP AddOn fetches a freshly-seen same-faction profile
 -- asynchronously, we also listen for the adapter's "profile updated" signal and
 -- originate when the data actually lands.
+--
+-- GUARD: every profile we *inject* (Tooltip module) also lands in the adapter's
+-- register and therefore fires the same "profile updated" signal. Without a
+-- break in that loop, one gossip message becomes: relay -> inject ->
+-- REGISTER_DATA_UPDATED -> re-extract -> re-originate -> re-broadcast, and each
+-- peer repeats it — churning the cache, flooding the comm channel, and forcing
+-- TRP3 to rebuild scan pins/tooltip groups from data whose profile bindings
+-- change underneath it (observed as duplicated map-scan results, issue #1).
+-- We therefore only re-originate for units the user actually selected
+-- (mouseover/target), and only when the profile's content version differs from
+-- what we last originated (self-triggered writes are identical, so they
+-- collapse to a no-op instead of cycling).
 
 local _, ns = ...
 local C = ns.Const
@@ -27,6 +39,11 @@ function Scanner:init()
 	-- bursts cannot flood the send queue.
 	self.receivedPending = {}
 	self.receivedQueue = {}
+
+	-- Last content version we originated per unit ID. Used to collapse
+	-- update-event feedback (see header comment) to a no-op.
+	-- [unitID] = contentVersion.
+	self.lastSharedVersion = {}
 end
 
 function Scanner:start()
@@ -96,6 +113,10 @@ function Scanner:onSelect(unit)
 end
 
 --- Handle an asynchronous profile update from an adapter.
+-- NOTE: this fires for ALL register writes, including our own injections (see
+-- header). Only re-share for units the user actually selected this session,
+-- and skip when the content version is unchanged since our last originate —
+-- otherwise our own injection writes would loop back around as new gossip.
 function Scanner:onAdapterUpdate(adapter, unitID)
 	local guid
 	if unitID == adapter:getPlayerUnitID() then
@@ -177,11 +198,21 @@ function Scanner:drainReceived()
 end
 
 --- Extract the profile and hand it to the broadcaster (which de-dups).
+-- The broadcaster's cache is content-version-aware, so unchanged content
+-- collapses to REFRESHED (no re-broadcast); that alone does not fully close
+-- the loop, though: repeated REFRESHED results keep the cache entry alive
+-- forever (TTL extension) and cost an extraction+encode each tick, so we also
+-- stop sharing early when the version matches what we last originated.
 function Scanner:share(adapter, unitID, guid)
 	local profile = adapter:extract(unitID)
-	if profile then
-		ns.broadcast:originate(guid, unitID, profile)
+	if not profile then
+		return
 	end
+	if self.lastSharedVersion[unitID] == profile.contentVersion then
+		return -- nothing new since our last originate (e.g. our own injection)
+	end
+	self.lastSharedVersion[unitID] = profile.contentVersion
+	ns.broadcast:originate(guid, unitID, profile)
 end
 
 -- Singleton.
