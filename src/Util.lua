@@ -153,6 +153,7 @@ local function fullUnitName(name)
 	end
 	return char .. "-" .. realm
 end
+Util.fullUnitName = fullUnitName
 
 -- Community roster ----------------------------------------------------------
 --

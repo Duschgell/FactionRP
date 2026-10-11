@@ -38,6 +38,10 @@ function Broadcast:init()
 	-- directory fills as gossip lands (drained at a bounded rate).
 	self.injectQueue = {} -- [guid] = candidate
 	self.injectOrder = {}
+
+	-- Pinned whisper targets for testing (/frp target), keyed by normalized
+	-- name. Always sent on every fanout, bypassing leg membership and caps.
+	self.forcedTargets = {}
 end
 
 function Broadcast:start()
@@ -108,6 +112,21 @@ function Broadcast:fanOut(chunks, context)
 		and ns.Util.normalizeUnitName(context.senderName)
 	local now = GetTime()
 	local sentKeys = {}
+
+	-- Pinned debug targets: guaranteed delivery, bypassing leg membership and
+	-- the caps (the echo-skip still applies — never whisper the source back).
+	-- Debug mode only (/frp debug), so normal users cannot defeat the
+	-- round-robin fairness by pinning.
+	local sentPinned = 0
+	if ns.db and ns.db.debug then
+		for key, name in pairs(self.forcedTargets) do
+			if key ~= skipName and not sentKeys[key] then
+				sentKeys[key] = true
+				comms:sendChunksAddon(chunks, "WHISPER", name)
+				sentPinned = sentPinned + 1
+			end
+		end
+	end
 
 	local function usageAt(key)
 		local u = self.commUsage[key]
@@ -197,8 +216,8 @@ function Broadcast:fanOut(chunks, context)
 			C.GUILD_RELAY_LIMIT
 		)
 	end
-	if (sentComm + sentGuild) > 0 and ns.debugFanout then
-		ns.debugFanout(sentComm, sentGuild)
+	if (sentComm + sentGuild + sentPinned) > 0 and ns.debugFanout then
+		ns.debugFanout(sentComm, sentGuild, sentPinned)
 	end
 end
 
@@ -350,6 +369,27 @@ function Broadcast:drainInject()
 		end
 		budget = budget - 1
 	end
+end
+
+--- Pin a whisper target for testing: always sent on every fanout, bypassing
+--- leg membership and caps. Returns the normalized "Name-Realm" or nil.
+function Broadcast:forceTarget(unitID)
+	local key = unitID and ns.Util.normalizeUnitName(unitID)
+	local display = key and ns.Util.fullUnitName(unitID)
+	if key and display then
+		self.forcedTargets[key] = display
+		return display
+	end
+end
+
+--- Drop all pinned targets. Returns the number removed.
+function Broadcast:clearForcedTargets()
+	local n = 0
+	for _ in pairs(self.forcedTargets) do
+		n = n + 1
+	end
+	self.forcedTargets = {}
+	return n
 end
 
 --- Record an opposite-faction club member whose profile reached us over the
