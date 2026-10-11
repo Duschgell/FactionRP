@@ -89,6 +89,32 @@ function Cache:tryStore(candidate)
 	return result
 end
 
+--- Resolve the store decision for a candidate WITHOUT its `data` payload.
+-- Returns a Cache.RESULT (REFRESHED or REJECTED) when the outcome doesn't
+-- need the payload, or nil when the caller must supply data via :tryStore
+-- (NEW or UPDATED). Lets the receive path skip expensive payload decoding
+-- for duplicates and stale copies. MUST stay in lockstep with :tryStore.
+--
+-- @param candidate table An entry table WITHOUT `data` or `added`.
+-- @return string|nil Cache.RESULT.REFRESHED / Cache.RESULT.REJECTED, or nil.
+function Cache:peek(candidate)
+	local now = GetTime()
+	local existing = self.entries[candidate.guid]
+	if existing and isExpired(existing, now) then
+		existing = nil
+	end
+
+	if not existing then
+		return nil -- NEW: needs data
+	elseif existing.contentVersion == candidate.contentVersion then
+		existing.added = now
+		return Cache.RESULT.REFRESHED
+	elseif candidate.originTime < existing.originTime then
+		return Cache.RESULT.REJECTED
+	end
+	return nil -- UPDATED: needs data
+end
+
 --- Look up a live (non-expired) entry by GUID. Expired entries are removed
 -- lazily on access and treated as absent.
 -- @param guid string
