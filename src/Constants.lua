@@ -57,6 +57,30 @@ C.CACHE_TTL = 300
 -- How often (seconds) the cache sweeps and removes expired entries.
 C.CACHE_SWEEP_INTERVAL = 60
 
+-- Received-profile re-broadcast ---------------------------------------------
+--
+-- When the RP AddOn reports profile data arriving over its own comm channels
+-- (see ProfileAdapter:registerReceivedListener), the Scanner re-broadcasts it
+-- through the normal originate pipeline. These values bound how much extra
+-- traffic that trigger can produce:
+--
+-- Receipts arrive as several per-section messages; we coalesce them by waiting
+-- RECEIVED_DEBOUNCE seconds after the last one. A further random delay of up to
+-- RECEIVED_JITTER seconds staggers simultaneous originators so the first peer
+-- copy to reach us suppresses ours via the cache's REFRESHED path.
+C.RECEIVED_DEBOUNCE = 1.5
+C.RECEIVED_JITTER = 4
+
+-- Received-trigger broadcasts drain through a bounded pending queue: at most
+-- one is fired per RECEIVED_ORIGIN_INTERVAL seconds, and the queue holds at
+-- most RECEIVED_ORIGIN_QUEUE entries (the oldest are dropped on overflow).
+C.RECEIVED_ORIGIN_INTERVAL = 5
+C.RECEIVED_ORIGIN_QUEUE = 20
+
+-- How long (seconds) a GUID-resolution result for a unitID is memoized, to
+-- bound the cost of Battle.net/club roster scans.
+C.GUID_RESOLVE_MEMO = 60
+
 -- Profiles ------------------------------------------------------------------
 
 -- The profile sections we replicate in v1. These mirror the section keys used
