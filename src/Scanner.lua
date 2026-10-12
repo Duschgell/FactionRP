@@ -34,11 +34,12 @@ function Scanner:init()
 	self.selected = {}
 
 	-- Profiles reported as received over the RP AddOn's own comm channels,
-	-- queued for re-broadcast. receivedPending maps unitID -> { adapter,
-	-- readyAt }; receivedQueue is the FIFO order, capped so sustained receipt
-	-- bursts cannot flood the send queue.
+	-- queued for re-broadcast. receivedPending maps unitID -> pooled
+	-- { adapter, readyAt } record; receivedQueue is the FIFO order, capped so
+	-- sustained receipt bursts cannot flood the send queue.
 	self.receivedPending = {}
 	self.receivedQueue = {}
+	self.pendingAcquire, self.pendingRelease = ns.Util.newPool(C.RECEIVED_ORIGIN_QUEUE)
 
 	-- Last content version we originated per unit ID. Used to collapse
 	-- update-event feedback (see header comment) to a no-op.
@@ -146,7 +147,10 @@ function Scanner:onAdapterReceived(adapter, unitID)
 		return
 	end
 
-	self.receivedPending[unitID] = { adapter = adapter, readyAt = readyAt }
+	local pending = self.pendingAcquire()
+	pending.adapter = adapter
+	pending.readyAt = readyAt
+	self.receivedPending[unitID] = pending
 	self.receivedQueue[#self.receivedQueue + 1] = unitID
 	if ns.statsQueueDepth then
 		ns.statsQueueDepth("received", #self.receivedQueue)
@@ -165,7 +169,11 @@ function Scanner:onAdapterReceived(adapter, unitID)
 	-- Bound the queue; the oldest pending receipts are the least valuable.
 	while #self.receivedQueue > C.RECEIVED_ORIGIN_QUEUE do
 		local dropped = table.remove(self.receivedQueue, 1)
+		local p = self.receivedPending[dropped]
 		self.receivedPending[dropped] = nil
+		if p then
+			self.pendingRelease(p)
+		end
 		if ns.statsError then
 			ns.statsError("received_queue_drop")
 		end
@@ -190,6 +198,7 @@ function Scanner:drainReceived()
 			self.receivedPending[unitID] = nil
 
 			local adapter = pending.adapter
+			self.pendingRelease(pending)
 			local guid = adapter and adapter:isAvailable() and ns.Util.resolveGUID(unitID)
 			if guid then
 				self:share(adapter, unitID, guid)

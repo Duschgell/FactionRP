@@ -12,7 +12,7 @@ ns.Const = C
 -- Identity -----------------------------------------------------------------
 
 C.ADDON_NAME = "FactionRP"
-C.VERSION = "0.2.3"
+C.VERSION = "0.2.1"
 
 -- Communication -------------------------------------------------------------
 
@@ -39,6 +39,11 @@ C.CHUNK_SIZE = 220
 C.SEND_INTERVAL = 0.2
 C.SEND_BURST = 3
 
+-- Cap on the reusable send-descriptor pool (the outbound queue stores pooled
+-- record tables instead of closures). Beyond this depth sends simply allocate
+-- — the pool bounds reuse, never work.
+C.POOL_SEND_DESC = 256
+
 -- How long (seconds) a partially-received multi-chunk message is kept before a
 -- missing chunk causes it to be discarded.
 C.REASSEMBLY_TIMEOUT = 60
@@ -48,6 +53,12 @@ C.REASSEMBLY_TIMEOUT = 60
 -- receives channel traffic, and connected realms share channels. The capability
 -- exists per the design, but is disabled by default to avoid duplicate traffic.
 C.RELAY_TO_FRIENDS = false
+
+-- How long (seconds) the online Battle.net game-account list is memoized.
+-- Enumerating WoW BNet friends allocates client tables per account, so the
+-- fanout reuses a cached list; gossip tolerates a few seconds of presence
+-- staleness.
+C.BNET_MEMO = 15
 
 -- Caching -------------------------------------------------------------------
 
@@ -106,6 +117,12 @@ C.COMM_USAGE_WINDOW = 60
 -- communities never stall a frame.
 C.COMM_ROSTER_MEMO = 45
 C.ROSTER_SLICE = 40
+
+-- Club member data (notably `faction`) streams in lazily. A rebuild that
+-- collected GUIDs but saw no faction values is assumed to have raced the
+-- stream: it is not published, and a retry is scheduled this many seconds
+-- out instead of waiting a full memo window.
+C.ROSTER_RETRY = 5
 
 -- Injection into the RP AddOn's register (populating its directory as gossip
 -- arrives) is queued: register writes fire the AddOn's own update/UI events,

@@ -16,7 +16,6 @@
 
 local _, ns = ...
 local C = ns.Const
-local Util = ns.Util
 
 local Serializer = {}
 ns.Serializer = Serializer
@@ -75,40 +74,46 @@ end
 -- DATA is always last so any "||" inside the encoded payload is preserved.
 
 local MESSAGE_FIELDS = 7
+local SEP_LEN = #C.SEPARATOR
 
 --- Build the envelope string from a message table.
 -- @param msg table { sender, subject, unitID, addon, originTime, contentVersion, data }
 --   where `data` is the already-encoded profile string.
 -- @return string
 function Serializer.buildMessage(msg)
-	return Util.join({
-		msg.sender,
-		msg.subject,
-		msg.unitID,
-		msg.addon,
-		tostring(msg.originTime),
-		msg.contentVersion,
-		msg.data,
-	})
+	local sep = C.SEPARATOR
+	return msg.sender .. sep .. msg.subject .. sep .. msg.unitID .. sep
+		.. msg.addon .. sep .. tostring(msg.originTime) .. sep
+		.. msg.contentVersion .. sep .. msg.data
 end
 
 --- Parse an envelope string back into a message table. Returns nil if the
--- field count is wrong.
+-- field count is wrong. Parsed positionally (six separator finds, no split
+-- table) to keep the inbound path allocation-light.
 -- @param str string
 -- @return table|nil
 function Serializer.parseMessage(str)
-	local f = Util.split(str, C.SEPARATOR, MESSAGE_FIELDS)
-	if #f < MESSAGE_FIELDS then
-		return nil
-	end
+	local sep = C.SEPARATOR
+	local s1 = str:find(sep, 1, true)
+	if not s1 then return nil end
+	local s2 = str:find(sep, s1 + SEP_LEN, true)
+	if not s2 then return nil end
+	local s3 = str:find(sep, s2 + SEP_LEN, true)
+	if not s3 then return nil end
+	local s4 = str:find(sep, s3 + SEP_LEN, true)
+	if not s4 then return nil end
+	local s5 = str:find(sep, s4 + SEP_LEN, true)
+	if not s5 then return nil end
+	local s6 = str:find(sep, s5 + SEP_LEN, true)
+	if not s6 then return nil end
 	return {
-		sender = f[1],
-		subject = f[2],
-		unitID = f[3],
-		addon = f[4],
-		originTime = tonumber(f[5]),
-		contentVersion = f[6],
-		data = f[7],
+		sender = str:sub(1, s1 - 1),
+		subject = str:sub(s1 + SEP_LEN, s2 - 1),
+		unitID = str:sub(s2 + SEP_LEN, s3 - 1),
+		addon = str:sub(s3 + SEP_LEN, s4 - 1),
+		originTime = tonumber(str:sub(s4 + SEP_LEN, s5 - 1)),
+		contentVersion = str:sub(s5 + SEP_LEN, s6 - 1),
+		data = str:sub(s6 + SEP_LEN),
 	}
 end
 
@@ -118,7 +123,6 @@ end
 -- are integers (never contain ":"), so a positional split with maxFields=4
 -- recovers PIECE intact even when it contains ":".
 
-local CHUNK_HEADER_FIELDS = 4
 local chunkCounter = 0 -- per-session id, unique together with the sender
 
 --- Split a full message string into wire chunks (each <= ~255 bytes including
@@ -133,50 +137,76 @@ function Serializer.chunk(message)
 	local chunks = {}
 	for i = 1, total do
 		local piece = message:sub((i - 1) * size + 1, i * size)
-		chunks[i] = string.format("%d:%d:%d:%s", msgId, i, total, piece)
+		chunks[i] = msgId .. ":" .. i .. ":" .. total .. ":" .. piece
 	end
 	return chunks
 end
 
 -- ChunkReassembler: buffers incoming chunks per (sender, msgId) until complete.
+-- Buffer and piece tables are pooled so steady-state reassembly allocates
+-- nothing beyond the inbound substrings themselves.
 local ChunkReassembler = ns.Class("ChunkReassembler")
 Serializer.ChunkReassembler = ChunkReassembler
 
+local BUF_POOL_CAP = 64
+
 function ChunkReassembler:init()
-	self.buffers = {} -- [sender\031msgId] = { total, count, dupes, pieces = {}, time }
+	self.buffers = {} -- [sender] = { [msgId] = { total, count, dupes, pieces, time } }
+	self.bufAcquire, self.bufRelease = ns.Util.newPool(BUF_POOL_CAP)
+	self.pieceAcquire, self.pieceRelease = ns.Util.newPool(BUF_POOL_CAP)
 end
 
 --- Feed one received chunk. Once the final missing chunk arrives, returns the
--- fully reassembled message string plus a metadata table
---   { chunks = total chunks received, elapsed = seconds first->last chunk,
---     dupes = duplicate chunk arrivals observed };
+-- fully reassembled message string plus
+--   chunks  = total chunks in the message,
+--   elapsed = seconds first->last chunk,
+--   dupes   = duplicate chunk arrivals observed;
 -- otherwise returns nil.
 -- @param sender      string A stable identifier for the sender.
 -- @param chunkString string The raw chunk as received.
--- @return string|nil, table|nil
+-- @return string|nil, number|nil, number|nil, number|nil
 function ChunkReassembler:add(sender, chunkString)
-	local f = Util.split(chunkString, ":", CHUNK_HEADER_FIELDS)
-	if #f < CHUNK_HEADER_FIELDS then
+	-- Manual header parse ("MSGID:INDEX:TOTAL:PIECE"): three colon finds,
+	-- no split-table allocation on the hottest inbound path.
+	local c1 = chunkString:find(":", 1, true)
+	if not c1 then
 		return nil
 	end
-	local msgId = f[1]
-	local index = tonumber(f[2])
-	local total = tonumber(f[3])
-	local piece = f[4]
+	local c2 = chunkString:find(":", c1 + 1, true)
+	if not c2 then
+		return nil
+	end
+	local c3 = chunkString:find(":", c2 + 1, true)
+	if not c3 then
+		return nil
+	end
+	local msgId = chunkString:sub(1, c1 - 1)
+	local index = tonumber(chunkString:sub(c1 + 1, c2 - 1))
+	local total = tonumber(chunkString:sub(c2 + 1, c3 - 1))
+	local piece = chunkString:sub(c3 + 1)
 	if not index or not total or total < 1 then
 		return nil
 	end
 
 	-- Single-chunk messages need no buffering.
 	if total == 1 then
-		return piece, { chunks = 1, elapsed = 0, dupes = 0 }
+		return piece, 1, 0, 0
 	end
 
-	local key = sender .. "\031" .. msgId
-	local buf = self.buffers[key]
+	local perSender = self.buffers[sender]
+	if not perSender then
+		perSender = {}
+		self.buffers[sender] = perSender
+	end
+	local buf = perSender[msgId]
 	if not buf then
-		buf = { total = total, count = 0, dupes = 0, pieces = {}, time = GetTime() }
-		self.buffers[key] = buf
+		buf = self.bufAcquire()
+		buf.total = total
+		buf.count = 0
+		buf.dupes = 0
+		buf.pieces = self.pieceAcquire()
+		buf.time = GetTime()
+		perSender[msgId] = buf
 	end
 	if not buf.pieces[index] then
 		buf.pieces[index] = piece
@@ -186,12 +216,17 @@ function ChunkReassembler:add(sender, chunkString)
 	end
 
 	if buf.count >= buf.total then
-		self.buffers[key] = nil
-		return table.concat(buf.pieces), {
-			chunks = buf.total,
-			elapsed = GetTime() - buf.time,
-			dupes = buf.dupes,
-		}
+		perSender[msgId] = nil
+		if not next(perSender) then
+			self.buffers[sender] = nil
+		end
+		local full = table.concat(buf.pieces)
+		local elapsed = GetTime() - buf.time
+		local chunks, dupes = buf.total, buf.dupes
+		self.pieceRelease(buf.pieces)
+		buf.pieces = nil
+		self.bufRelease(buf)
+		return full, chunks, elapsed, dupes
 	end
 	return nil
 end
@@ -203,10 +238,18 @@ end
 function ChunkReassembler:prune(maxAge)
 	local now = GetTime()
 	local dropped = 0
-	for key, buf in pairs(self.buffers) do
-		if (now - buf.time) > maxAge then
-			self.buffers[key] = nil
-			dropped = dropped + 1
+	for sender, perSender in pairs(self.buffers) do
+		for msgId, buf in pairs(perSender) do
+			if (now - buf.time) > maxAge then
+				perSender[msgId] = nil
+				self.pieceRelease(buf.pieces)
+				buf.pieces = nil
+				self.bufRelease(buf)
+				dropped = dropped + 1
+			end
+		end
+		if not next(perSender) then
+			self.buffers[sender] = nil
 		end
 	end
 	return dropped

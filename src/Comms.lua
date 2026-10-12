@@ -12,12 +12,24 @@ local C = ns.Const
 local Comms = ns.Class("Comms")
 ns.Comms = Comms
 
+local bnKeys = {} -- [gameAccountID] = "bn:<id>" senderKey (persistent)
+
 function Comms:init()
 	self.prefix = C.MSG_PREFIX
 	self.assembler = ns.Serializer.ChunkReassembler:new()
-	self.queue = {} -- FIFO of pending send closures
+	-- The paced outbound queue holds *descriptors* (pooled records), not
+	-- closures: a send at steady state allocates nothing.
+	self.queue = { head = 1, tail = 0 }
+	self.descAcquire, self.descRelease = ns.Util.newPool(C.POOL_SEND_DESC)
 	self.messageHandler = nil -- set by Broadcast: fn(rawMessage, context)
 	self.started = false
+	-- Memoized online WoW BNet account ids (see bnetAccounts).
+	self.bnetAcctMemo = { ids = {}, at = 0 }
+	-- Scratch transport contexts, mutated per inbound event. Passed to the
+	-- message handler — valid only for the duration of that synchronous call
+	-- (scratch: do not retain).
+	self.chatCtx = { medium = nil, senderName = nil, senderKey = nil, gameAccountID = nil }
+	self.bnCtx = { medium = "BNET", senderName = nil, senderKey = nil, gameAccountID = nil }
 end
 
 -- Lifecycle -----------------------------------------------------------------
@@ -91,21 +103,82 @@ end
 
 -- Outbound queue ------------------------------------------------------------
 
---- Queue a send closure for paced delivery.
-function Comms:enqueue(fn)
-	self.queue[#self.queue + 1] = fn
+--- Number of sends currently queued.
+function Comms:queueDepth()
+	local q = self.queue
+	return q.tail - q.head + 1
+end
+
+--- Queue a send descriptor for paced delivery.
+function Comms:enqueue(desc)
+	local q = self.queue
+	q.tail = q.tail + 1
+	q[q.tail] = desc
 	if ns.statsQueue then
-		ns.statsQueue(#self.queue)
+		ns.statsQueue(q.tail - q.head + 1)
+	end
+end
+
+--- Interpret a queued descriptor and dispatch it through Chomp (or the raw
+-- API fallback), recording the chunk/leg stats hooks. After dispatch the
+-- descriptor is released back to the pool.
+function Comms:sendDescriptor(desc)
+	local text = desc.text
+	if ns.statsChunkOut then
+		ns.statsChunkOut(desc.kind, #text, GetTime() - desc.enqueuedAt)
+	end
+	if ns.debugChunk then
+		ns.debugChunk("out", desc.kind, desc.target, #text)
+	end
+	-- The final chunk of a leg carries leg-completion fields so the stats
+	-- collector can time the full message drain — no callback closure needed.
+	if desc.legTotal and ns.statsOutLeg then
+		ns.statsOutLeg(desc.kind, desc.target, desc.legBytes, desc.legTotal, GetTime() - desc.legStartedAt)
+	end
+	local chomp = AddOn_Chomp
+	if desc.mode == "bnet" then
+		if chomp and chomp.BNSendGameData then
+			chomp.BNSendGameData(desc.target, self.prefix, text, "LOW")
+			return
+		end
+		if BNSendGameData then
+			BNSendGameData(desc.target, self.prefix, text)
+		end
+		return
+	end
+	-- Routing through Chomp (shipped by TRP3, and hence by every client
+	-- running any major RP AddOn) means our bulk gossip traffic is coalesced
+	-- into the same global ChatThrottleLib queues as everyone else's addon
+	-- traffic. Raw C_ChatInfo.SendAddonMessage bursts from the queue can
+	-- stall other add-ons' queued CHANNEL messages (notably TRP3's C_SCAN
+	-- map-scan requests, which are sent unthrottled at scan time and are
+	-- sensitive to chat-frame send backoff).
+	if chomp and chomp.SendAddonMessage then
+		chomp.SendAddonMessage(self.prefix, text, desc.kind, desc.target, "LOW")
+		return
+	end
+	if C_ChatInfo and C_ChatInfo.SendAddonMessage then
+		C_ChatInfo.SendAddonMessage(self.prefix, text, desc.kind, desc.target)
 	end
 end
 
 --- Release up to SEND_BURST queued sends. Invoked on a timer.
 function Comms:flushQueue()
+	local q = self.queue
+	local head = q.head
 	local budget = C.SEND_BURST
-	while budget > 0 and #self.queue > 0 do
-		local fn = table.remove(self.queue, 1)
-		fn()
+	while budget > 0 and head <= q.tail do
+		local desc = q[head]
+		q[head] = nil
+		head = head + 1
+		self:sendDescriptor(desc)
+		self.descRelease(desc)
 		budget = budget - 1
+	end
+	q.head = head
+	if head > q.tail then
+		-- Queue drained: reset indices so the array part stays small.
+		q.head, q.tail = 1, 0
 	end
 end
 
@@ -115,72 +188,33 @@ end
 -- @param text   string The chunk.
 -- @param kind   string "CHANNEL" | "PARTY" | "RAID" | "INSTANCE_CHAT" | "WHISPER".
 -- @param target any    Channel index (for CHANNEL) or player name (for WHISPER).
--- Routing through Chomp (shippped by TRP3, and hence by every client running
--- any major RP AddOn) means our bulk gossip traffic is coalesced into the
--- same global ChatThrottleLib queues as everyone else's addon traffic. Raw
--- C_ChatInfo.SendAddonMessage bursts from the queue can stall other add-ons'
--- queued CHANNEL messages (notably TRP3's C_SCAN map-scan requests, which are
--- sent unthrottled at scan time and are sensitive to chat-frame send backoff).
--- @param onSent function? Optional callback invoked when the chunk is
---   dequeued for sending (used to time a message's drain per leg).
-function Comms:sendAddon(text, kind, target, onSent)
-	local enqueuedAt = GetTime()
-	self:enqueue(function()
-		if ns.statsChunkOut then
-			ns.statsChunkOut(kind, #text, GetTime() - enqueuedAt)
-		end
-		if ns.debugChunk then
-			ns.debugChunk("out", kind, target, #text)
-		end
-		if onSent then
-			onSent()
-		end
-		local chomp = AddOn_Chomp
-		if chomp and chomp.SendAddonMessage then
-			chomp.SendAddonMessage(self.prefix, text, kind, target, "LOW")
-			return
-		end
-		if C_ChatInfo and C_ChatInfo.SendAddonMessage then
-			C_ChatInfo.SendAddonMessage(self.prefix, text, kind, target)
-		end
-	end)
+-- @return table The queued descriptor (callers may stamp leg-completion fields).
+function Comms:sendAddon(text, kind, target)
+	local desc = self.descAcquire()
+	desc.mode = "addon"
+	desc.text = text
+	desc.kind = kind
+	desc.target = target
+	desc.enqueuedAt = GetTime()
+	self:enqueue(desc)
+	return desc
 end
 
 --- Send one raw chunk to a Battle.net game account.
-function Comms:sendBNet(text, gameAccountID, onSent)
-	local enqueuedAt = GetTime()
-	self:enqueue(function()
-		if ns.statsChunkOut then
-			ns.statsChunkOut("BNET", #text, GetTime() - enqueuedAt)
-		end
-		if ns.debugChunk then
-			ns.debugChunk("out", "BNET", gameAccountID, #text)
-		end
-		if onSent then
-			onSent()
-		end
-		local chomp = AddOn_Chomp
-		if chomp and chomp.BNSendGameData then
-			chomp.BNSendGameData(gameAccountID, self.prefix, text, "LOW")
-			return
-		end
-		if BNSendGameData then
-			BNSendGameData(gameAccountID, self.prefix, text)
-		end
-	end)
+function Comms:sendBNet(text, gameAccountID)
+	local desc = self.descAcquire()
+	desc.mode = "bnet"
+	desc.text = text
+	desc.kind = "BNET"
+	desc.target = gameAccountID
+	desc.enqueuedAt = GetTime()
+	self:enqueue(desc)
+	return desc
 end
 
 -- Convenience: send a list of chunks over a single medium ------------------
--- The final chunk's send closure carries a completion marker so the stats
+-- The final chunk's descriptor carries leg-completion fields so the stats
 -- collector can time how long a full message took to drain to this leg.
-
-local function legDone(startedAt, bytes, kind, target, total)
-	return function()
-		if ns.statsOutLeg then
-			ns.statsOutLeg(kind, target, bytes, total, GetTime() - startedAt)
-		end
-	end
-end
 
 function Comms:sendChunksAddon(chunks, kind, target)
 	local n = #chunks
@@ -189,7 +223,12 @@ function Comms:sendChunksAddon(chunks, kind, target)
 		bytes = bytes + #chunks[i]
 	end
 	for i = 1, n do
-		self:sendAddon(chunks[i], kind, target, i == n and legDone(startedAt, bytes, kind, target, n) or nil)
+		local desc = self:sendAddon(chunks[i], kind, target)
+		if i == n then
+			desc.legStartedAt = startedAt
+			desc.legBytes = bytes
+			desc.legTotal = n
+		end
 	end
 end
 
@@ -200,7 +239,12 @@ function Comms:sendChunksBNet(chunks, gameAccountID)
 		bytes = bytes + #chunks[i]
 	end
 	for i = 1, n do
-		self:sendBNet(chunks[i], gameAccountID, i == n and legDone(startedAt, bytes, "BNET", gameAccountID, n) or nil)
+		local desc = self:sendBNet(chunks[i], gameAccountID)
+		if i == n then
+			desc.legStartedAt = startedAt
+			desc.legBytes = bytes
+			desc.legTotal = n
+		end
 	end
 end
 
@@ -242,6 +286,26 @@ function Comms:eachBNetGameAccount(callback)
 	end
 end
 
+--- Online WoW Battle.net game account ids, memoized for C.BNET_MEMO seconds.
+-- Enumerating friends allocates client tables per account; the fanout uses
+-- this memoized list instead of a full scan per message.
+-- @return table List of gameAccountIDs (do not mutate — shared reference).
+function Comms:bnetAccounts()
+	local memo = self.bnetAcctMemo
+	local now = GetTime()
+	if (now - memo.at) > C.BNET_MEMO then
+		local ids = memo.ids
+		for i = #ids, 1, -1 do
+			ids[i] = nil
+		end
+		self:eachBNetGameAccount(function(id)
+			ids[#ids + 1] = id
+		end)
+		memo.at = now
+	end
+	return memo.ids
+end
+
 --- Invoke callback(characterName) for every online (same-faction) WoW friend.
 function Comms:eachOnlineFriend(callback)
 	if not C_FriendList then
@@ -262,32 +326,51 @@ function Comms:onChatMsgAddon(prefix, text, channel, sender)
 	if prefix ~= self.prefix then
 		return
 	end
-	self:handleIncoming(text, { medium = channel, senderName = sender })
+	local ctx = self.chatCtx
+	ctx.medium = channel
+	ctx.senderName = sender
+	ctx.senderKey = sender
+	ctx.gameAccountID = nil
+	self:handleIncoming(text, ctx)
 end
 
 function Comms:onBNChatMsgAddon(prefix, text, bnetIDGameAccount)
 	if prefix ~= self.prefix then
 		return
 	end
-	self:handleIncoming(text, { medium = "BNET", gameAccountID = bnetIDGameAccount })
+	local key = bnetIDGameAccount and bnKeys[bnetIDGameAccount]
+	if not key then
+		key = "bn:" .. tostring(bnetIDGameAccount)
+		if bnetIDGameAccount then
+			bnKeys[bnetIDGameAccount] = key
+		end
+	end
+	local ctx = self.bnCtx
+	ctx.medium = "BNET"
+	ctx.senderName = nil
+	ctx.senderKey = key
+	ctx.gameAccountID = bnetIDGameAccount
+	self:handleIncoming(text, ctx)
 end
 
 --- Reassemble a chunk and, once a full message is available, hand it to the
 -- registered message handler with transport context (used by Broadcast for
 -- loop avoidance and to avoid echoing back to the source peer).
+-- NOTE: `context` is a shared scratch table — valid only for the duration of
+-- this synchronous call chain (incl. messageHandler). Never retain it.
 function Comms:handleIncoming(chunkString, context)
 	-- Reassembly is keyed by a stable per-sender identity.
-	local senderKey = context.senderName or ("bn:" .. tostring(context.gameAccountID))
+	local senderKey = context.senderKey
 	if ns.statsChunkIn then
 		ns.statsChunkIn(context.medium, #chunkString)
 	end
 	if ns.debugChunk then
 		ns.debugChunk("in", context.medium, senderKey, #chunkString)
 	end
-	local full, meta = self.assembler:add(senderKey, chunkString)
+	local full, chunks, elapsed, dupes = self.assembler:add(senderKey, chunkString)
 	if full then
 		if ns.statsIn then
-			ns.statsIn(full, senderKey, context.medium, meta)
+			ns.statsIn(full, senderKey, context.medium, chunks, elapsed, dupes)
 		end
 		if self.messageHandler then
 			self.messageHandler(full, context)

@@ -194,9 +194,32 @@ local function bumpMedium(t, medium, msgs, bytes, chunks)
 	m.chunks = m.chunks + chunks
 end
 
-local function pushRecent(entry)
+--- Write a record into the recent ring, reusing the slot's entry table so
+-- recording allocates nothing once the ring has wrapped once.
+local function pushRecent(dir, medium, peer, bytes, chunks, ms)
 	local r = stats.recent
-	push(r, entry)
+	local cap = r.cap
+	local i = r.i + 1
+	if i > cap then
+		i = 1
+	end
+	r.i = i
+	if r.n < cap then
+		r.n = r.n + 1
+	end
+	local e = r[i]
+	if not e then
+		e = {}
+		r[i] = e
+	end
+	e.dir = dir
+	e.medium = medium
+	e.peer = peer
+	e.subject = nil -- stamped later via statsTagSubject
+	e.bytes = bytes
+	e.chunks = chunks
+	e.ms = ms
+	e.at = GetTime()
 end
 
 -- Recorders --------------------------------------------------------------------
@@ -210,20 +233,16 @@ local function recChunkIn(medium, bytes)
 	bumpMedium(stats.mediumsIn, medium, 0, bytes, 1)
 end
 
-local function recIn(full, senderKey, medium, meta)
+local function recIn(full, senderKey, medium, chunks, elapsed, dupes)
 	local bytes = #full
 	stats.inMsgs = stats.inMsgs + 1
 	stats.inBytes = stats.inBytes + bytes
-	stats.dupChunks = stats.dupChunks + (meta.dupes or 0)
+	stats.dupChunks = stats.dupChunks + (dupes or 0)
 	bumpMedium(stats.mediumsIn, medium, 1, 0, 0)
 	push(stats.inSizes, bytes)
-	push(stats.assembleMs, meta.elapsed * 1000)
+	push(stats.assembleMs, elapsed * 1000)
 	bumpRate(stats.rateIn, GetTime())
-	pushRecent({
-		dir = "in", medium = medium, peer = senderKey,
-		bytes = bytes, chunks = meta.chunks, ms = meta.elapsed * 1000,
-		at = GetTime(),
-	})
+	pushRecent("in", medium, senderKey, bytes, chunks, elapsed * 1000)
 end
 
 --- Stamp the subject GUID onto the newest inbound recent entry once Broadcast
@@ -255,11 +274,7 @@ local function recOutLeg(medium, target, bytes, chunks, elapsed)
 	bumpMedium(stats.mediumsOut, medium, 1, bytes, chunks)
 	push(stats.transmitMs, elapsed * 1000)
 	bumpRate(stats.rateLegs, GetTime())
-	pushRecent({
-		dir = "out", medium = medium, peer = target,
-		bytes = bytes, chunks = chunks, ms = elapsed * 1000,
-		at = GetTime(),
-	})
+	pushRecent("out", medium, target, bytes, chunks, elapsed * 1000)
 end
 
 --- A logical outbound message was built (originate or relay).
@@ -494,7 +509,7 @@ end
 function SECTIONS.queue()
 	local s = ns.Stats.snapshot()
 	ns.Print(("send queue: depth %d | high-water %d | dwell avg %s max %s"):format(
-		ns.comms and #ns.comms.queue or 0, s.queue.highWater,
+		ns.comms and ns.comms:queueDepth() or 0, s.queue.highWater,
 		s.queue.dwellN > 0 and fmtMs(s.queue.dwellSum / s.queue.dwellN * 1000) or "n/a",
 		fmtMs(s.queue.dwellMax * 1000)))
 	for name, depth in pairs(s.queues) do
@@ -547,3 +562,96 @@ ns.RegisterCommand("stats", function(arg)
 	end
 	printSummary()
 end, "Show traffic statistics; sections: mediums sizes timing cache errors queue last [n] | 'reset'")
+
+-- /factionrp mem ---------------------------------------------------------------
+-- Memory diagnostics. GetAddOnMemoryUsage is a cached counter, so every read
+-- is preceded by UpdateAddOnMemoryUsage; a forced collect first makes the
+-- figure report live (retained) memory rather than pending garbage.
+
+local function memKB()
+	collectgarbage("collect")
+	UpdateAddOnMemoryUsage()
+	return GetAddOnMemoryUsage(C.ADDON_NAME)
+end
+
+local function mapSize(t)
+	local n = 0
+	for _ in pairs(t or {}) do
+		n = n + 1
+	end
+	return n
+end
+
+local function printCensus()
+	ns.Print(("mem census | %.1f KB (after GC + refresh)"):format(memKB()))
+	local comms = ns.comms
+	if comms then
+		local bufs, senders = 0, 0
+		for _, per in pairs(comms.assembler.buffers) do
+			senders = senders + 1
+			for _ in pairs(per) do
+				bufs = bufs + 1
+			end
+		end
+		ns.Print(("  send queue %d | reassembly %d bufs / %d senders | bnet memo %d ids"):format(
+			comms:queueDepth(), bufs, senders, #comms.bnetAcctMemo.ids))
+	end
+	if ns.cache then
+		ns.Print(("  cache entries %d"):format(ns.cache:count()))
+	end
+	local b = ns.broadcast
+	if b then
+		ns.Print(("  inject %d | relays %d | contacts %d | commUsage %d | pinned %d"):format(
+			b:injectDepth(), mapSize(b.knownRelays), mapSize(b.xfacContacts),
+			mapSize(b.commUsage), mapSize(b.forcedTargets)))
+	end
+	local sc = ns.scanner
+	if sc then
+		ns.Print(("  received q %d / pending %d | selected %d | lastShared %d"):format(
+			#sc.receivedQueue, mapSize(sc.receivedPending), mapSize(sc.selected),
+			mapSize(sc.lastSharedVersion)))
+	end
+	local roster = ns.Util._roster and ns.Util._roster()
+	if roster then
+		ns.Print(("  roster xfac %d / guild %d | names %d | guids %d | guidMemo %d"):format(
+			#roster.xfac, #roster.xfacGuild, mapSize(roster.factionByName),
+			mapSize(roster.guidByName), mapSize(ns.Util._guidMemo and ns.Util._guidMemo())))
+	end
+end
+
+ns.RegisterCommand("mem", function(arg)
+	arg = arg and ns.Util.trim(arg) or ""
+	local sub, rest = arg:match("^(%S*)%s*(.-)$")
+	sub = sub and sub:lower() or ""
+	if sub == "churn" then
+		-- Sample the (uncollected) counter each second after a forced GC: the
+		-- peak-to-baseline delta approximates the allocation backlog, i.e.
+		-- churn between GC cycles.
+		local ticks = math.max(1, math.floor(tonumber(rest) or 10))
+		local baseline = memKB()
+		local peak = baseline
+		local elapsed = 0
+		ns.Print(("mem baseline %.1f KB; sampling churn over %ds ..."):format(baseline, ticks))
+		local ticker
+		ticker = C_Timer.NewTicker(1, function()
+			elapsed = elapsed + 1
+			UpdateAddOnMemoryUsage()
+			local kb = GetAddOnMemoryUsage(C.ADDON_NAME)
+			if kb > peak then
+				peak = kb
+			end
+			if elapsed >= ticks then
+				ticker:Cancel()
+				ns.Print(("mem churn: %.1f KB -> %.1f KB (peak %.1f, +%.1f KB backlog)"):format(
+					baseline, kb, peak, peak - baseline))
+			end
+		end)
+		return
+	end
+	if sub == "census" then
+		printCensus()
+		return
+	end
+	ns.Print(("mem: %.1f KB (after GC + refresh)"):format(memKB()))
+	ns.Print("  sections: churn [n] census")
+end, "Show live addon memory; 'churn [n]' samples allocation rate, 'census' counts suspect tables")

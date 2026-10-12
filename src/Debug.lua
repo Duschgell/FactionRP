@@ -62,9 +62,13 @@ local function logSkip(unitID, reason)
 	ns.Print(("|cffffd200[skip]|r %s (%s)"):format(tostring(unitID), tostring(reason)))
 end
 
+local function pickText(t)
+	return #t > 0 and (tostring(#t) .. " (" .. table.concat(t, ", ") .. ")") or "0"
+end
+
 local function logFanout(community, guild, pinned)
-	ns.Print(("|cffffd200[broadcast]|r whispers: %d community, %d guild, %d pinned"):format(
-		community, guild, pinned or 0
+	ns.Print(("|cffffd200[broadcast]|r whispers — community: %s | guild: %s | pinned: %s"):format(
+		pickText(community), pickText(guild), pickText(pinned)
 	))
 end
 
@@ -195,6 +199,38 @@ ns.RegisterCommand("debug", function(arg)
 	end)(), ", ") .. ", target")
 end, "List debug flags; '<category>' toggles one, 'all' toggles all, 'target <name>' pins a whisper test target")
 
+-- /factionrp relays ----------------------------------------------------------
+
+local function joined(t)
+	return #t > 0 and table.concat(t, ", ") or "none"
+end
+
+local function mapNames(t)
+	local names = {}
+	for _, v in pairs(t or {}) do
+		names[#names + 1] = v
+	end
+	table.sort(names)
+	return names
+end
+
+--- Show what the relay-selection machinery currently knows: confirmed FRP
+-- whisper relays, proven xfac contacts, online roster candidates, and the
+-- actual picks from the most recent fanout.
+ns.RegisterCommand("relays", function()
+	local b = ns.broadcast
+	if not b then
+		return
+	end
+	ns.Print("known relays (confirmed FRP): " .. joined(mapNames(b.knownRelays)))
+	ns.Print("xfac contacts (reachable, unconfirmed): " .. joined(mapNames(b.xfacContacts)))
+	ns.Print(("roster candidates: %d community / %d guild"):format(
+		#ns.Util.xfacClubMembers(), #ns.Util.xfacGuildMembers()))
+	local p = b.lastLegPicks
+	ns.Print(("last fanout — community: %s | guild: %s | bnet: %s | pinned: %s"):format(
+		joined(p.community), joined(p.guild), joined(p.bnet), joined(p.pinned)))
+end, "Show learned relays/contacts and the last fanout's chosen targets")
+
 -- Richer status command (overrides the placeholder registered in Core).
 ns.RegisterCommand("status", function()
 	local adapter = ns.getAvailableAdapter()
@@ -215,7 +251,7 @@ ns.RegisterCommand("status", function()
 		C.VERSION,
 		ns.cache and ns.cache:count() or 0,
 		ns.scanner and #ns.scanner.receivedQueue or 0,
-		ns.comms and #ns.comms.queue or 0,
+		ns.comms and ns.comms:queueDepth() or 0,
 		relays,
 		contacts,
 		adapter and adapter.name or "|cffff5555none|r",
