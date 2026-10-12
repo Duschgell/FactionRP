@@ -79,8 +79,9 @@ local function resetStore()
 	stats.senders, stats.senderN = {}, 0
 	stats.subjects, stats.subjectN = {}, 0
 
-	stats.rateIn = { b = freshBuckets() }
-	stats.rateOut = { b = freshBuckets() }
+	stats.rateIn = { b = freshBuckets() }   -- logical inbound messages/s
+	stats.rateOut = { b = freshBuckets() }  -- logical outbound messages/s
+	stats.rateLegs = { b = freshBuckets() } -- per-leg outbound completions/s
 
 	stats.recent = { cap = C.STATS_RECENT, n = 0, i = 0 } -- {dir, medium, peer, subject, bytes, chunks, ms, at}
 end
@@ -253,7 +254,7 @@ local function recOutLeg(medium, target, bytes, chunks, elapsed)
 	stats.outSends = stats.outSends + 1
 	bumpMedium(stats.mediumsOut, medium, 1, bytes, chunks)
 	push(stats.transmitMs, elapsed * 1000)
-	bumpRate(stats.rateOut, GetTime())
+	bumpRate(stats.rateLegs, GetTime())
 	pushRecent({
 		dir = "out", medium = medium, peer = target,
 		bytes = bytes, chunks = chunks, ms = elapsed * 1000,
@@ -268,6 +269,7 @@ local function recOutMessage(bytes, chunks, subject, how)
 	push(stats.outSizes, bytes)
 	local key = how or "send"
 	stats.legs[key] = (stats.legs[key] or 0) + 1
+	bumpRate(stats.rateOut, GetTime())
 end
 
 local function recQueue(depth)
@@ -375,8 +377,10 @@ function ns.Stats.snapshot()
 		medOriginAge = median(stats.originAge),
 		rateIn = uptime > 0 and rateCount(stats.rateIn, now) / (uptime < C.STATS_RATE_WINDOW and uptime or C.STATS_RATE_WINDOW) or 0,
 		rateOut = uptime > 0 and rateCount(stats.rateOut, now) / (uptime < C.STATS_RATE_WINDOW and uptime or C.STATS_RATE_WINDOW) or 0,
+		rateLegs = uptime > 0 and rateCount(stats.rateLegs, now) / (uptime < C.STATS_RATE_WINDOW and uptime or C.STATS_RATE_WINDOW) or 0,
 		rateInSession = uptime > 0 and inN / uptime or 0,
 		rateOutSession = uptime > 0 and outN / uptime or 0,
+		rateLegsSession = uptime > 0 and stats.outSends / uptime or 0,
 		dupChunks = stats.dupChunks,
 		incomplete = stats.incomplete,
 		mediumsIn = stats.mediumsIn,
@@ -418,9 +422,9 @@ local SECTIONS = {}
 
 local function printSummary()
 	local s = ns.Stats.snapshot()
-	ns.Print(("stats | uptime %s | in %d msgs (%s, %.2f/s) | out %d msgs (%s, %.2f/s) | legs %d"):format(
+	ns.Print(("stats | uptime %s | in %d msgs (%s, %.2f msg/s) | out %d msgs (%s, %.2f msg/s, %.2f legs/s) | legs %d"):format(
 		("%ds"):format(s.uptime), s.inMsgs, fmtBytes(s.inBytes), s.rateIn,
-		s.outMsgs, fmtBytes(s.outBytes), s.rateOut, s.outSends
+		s.outMsgs, fmtBytes(s.outBytes), s.rateOut, s.rateLegs, s.outSends
 	))
 	ns.Print(("  sizes in avg/med %s/%s | out avg/med %s/%s | assemble med/max %s/%s | transmit med/max %s/%s"):format(
 		fmtBytes(s.avgInSize), fmtBytes(s.medInSize),
