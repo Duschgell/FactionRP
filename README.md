@@ -217,23 +217,58 @@ Running the base command with no (or an unrecognised) sub-command prints the usa
 
 * `/factionrp status` — Show the version, number of cached profiles, pending
   re-broadcasts, send-queue depth, known relay/contact counts, the active RP
-  adapter (e.g. TRP3) and whether debug mode is on.
+  adapter (e.g. TRP3) and which debug categories are on.
 * `/factionrp purge` — Empty the profile cache (testing).
-* `/factionrp debug` — Toggle debug mode on/off (see below).
+* `/factionrp debug` — List the debug categories and their on/off state.
+* `/factionrp debug <category>` — Toggle one debug category (see below).
+* `/factionrp debug all [on|off]` — Toggle every category at once.
 * `/factionrp debug target [Name-Realm]` — Pin a whisper target that bypasses
   the community/guild selection and caps (testing). `clear` resets; no argument
-  lists pins. Only sends while debug mode is on.
+  lists pins. Only sends while the `targets` category (or `all`) is on.
+* `/factionrp stats [section]` — Show collected traffic statistics (requires
+  the `stats` category). Sections: `mediums`, `sizes`, `timing`, `cache`,
+  `errors`, `queue`, `last [n]`; `reset` zeroes everything.
 
 ### Debug Mode
 
-The `/factionrp debug` command enables/disables debug mode.
-In debug mode, a message is printed out every time the following happens:
+Debug output is fractionalised: each category can be enabled independently so
+debugging can be targeted, or everything can be enabled at once with
+`/frp debug all`. Flags persist in saved variables as `FactionRPDB.debug`.
 
-* A broadcast is sent, including target GUID
-* A message is received, including sender GUID
-* A profile is stored or refreshed in the cache
-* A received RP-AddOn profile is queued for re-broadcast, or skipped
-* A fanout sends community/guild/pinned whispers (per-leg counts)
+The categories:
+
+* `broadcast` — a broadcast is sent, including subject GUID
+* `receive` — a message is received, including sender GUID
+* `cache` — a profile is stored or refreshed in the cache
+* `queue` — a received RP-AddOn profile is queued for re-broadcast, or skipped
+* `fanout` — a fanout sends community/guild/pinned whispers (per-leg counts)
+* `chunks` — every wire chunk sent or received (very noisy)
+* `targets` — allows pinned whisper targets (`/frp debug target`) to send
+* `stats` — collects traffic statistics (see below)
+
+### Traffic statistics
+
+With the `stats` category enabled, FactionRP records session-only traffic
+statistics (nothing is persisted, and everything is bounded so long sessions
+cannot grow memory):
+
+* Inbound/outbound message counts, byte sizes (average and median), and
+  per-second rates over a rolling 60 second window plus the session average
+* Profile reassembly time: first to last chunk of a multi-chunk message
+* Transmit time: enqueue to last chunk sent, per leg
+* Per-medium breakdowns (channel, group, Battle.net, whisper) and per-leg
+  fanout totals
+* Cache outcomes (new/updated/refreshed/rejected), error tallies (malformed,
+  undecodable, self-echo, reassembly timeouts, duplicate chunks, queue drops)
+* Queue health: send-queue high-water mark, per-chunk dwell, inject/received
+  queue depths
+* Origin age on receipt (approximate — depends on the sender's clock)
+* Unique senders/subjects seen this session
+* A ring buffer of the last 50 messages for close inspection
+  (`/frp stats last [n]`)
+
+`/frp stats` prints a summary; the sections drill into each area. The same
+data is available programmatically via `ns.Stats.snapshot()`.
 
 ### Additional Plans
 
