@@ -1,5 +1,124 @@
 ﻿# FactionRP Changelog
 
+## 0.3.0
+
+### Changed — pull model (breaking protocol change)
+
+- **Profile data no longer floods.** The push-gossip fanout is replaced by a
+  pull exchange: selecting an opposite-faction player (mouseover/target)
+  sends a single-chunk `REQ <guid>` to the mesh; the first peer that can
+  serve the profile `ACK`s, is granted `OK`, and pushes the data envelope
+  directly to the requester. Later `ACK`s receive `NOK`. Requests dedupe per
+  subject, expire (15s no-ACK / 30s no-data), cool down per subject (60s),
+  and are bounded (`REQ_MAX_PENDING`).
+- Hard protocol partition: every envelope carries `C.PROTO_MAJOR` (currently
+  3) as a dedicated field, and receivers reject lower generations before any
+  peer-state side effect — older or modified clients cannot confirm a relay,
+  serve a request, or feed the cache. The comm channel is now `frp3comms`,
+  so older clients sit on a disjoint channel entirely; on load and each
+  re-join we also actively leave the legacy `FactionRP` channel and any
+  foreign-generation `frp<N>comms` channel, since channel membership
+  survives `/reload`.
+- Data is never relayed: inbound profiles are cached and injected into the
+  RP AddOn's register only. Local extraction (`Scanner`) now *publishes* to
+  the cache without touching the wire, so every client can serve what it
+  has seen.
+- All control traffic is the FRP1 control channel — ordinary envelopes with
+  the reserved subject `_frp` and `data = "FRP1 <verb> <arg>"` — never
+  cached, injected, or relayed, and harmlessly dropped by older clients.
+- Wire format documented in `doc/protocol.md`.
+
+### Added
+
+- Battle.net peer confirmation handshake (`HELLO`/`HI`): BNet data and `REQ`
+  legs go only to accounts that have proven they run the AddOn. Unconfirmed
+  friends receive rotating probes; 3 unanswered probes ignore an account for
+  30 min (cleared early by friend-presence events). Confirmations expire
+  after 10 min without fresh proof.
+- New `peers` debug category logging probes, confirmations, ignores, and
+  REQ/ACK/OK/NOK exchange events. `/frp relays` now shows BNet peer buckets
+  and pending request/serve counts.
+- `TRP3Adapter:canServe` (cheap existence check for the server path) and a
+  roster `guid -> unitID` map for resolving request subjects.
+
+### Changed
+
+- Outbound pacing is a single dial: `C.SEND_RATE` chunks/second (token
+  bucket on the 0.2s tick) replaces `SEND_BURST`; default 7.5 (~50% lower).
+- Community/guild relay limits raised to 10 each — these legs now carry
+  single-chunk control messages, not profile data.
+- `sendChunks*` return false on whole-leg queue drop so callers (probes,
+  grants) only stamp state for sends that actually queued.
+- `RELAY_TO_FRIENDS` and the `broadcast` debug category removed (no data
+  fanout remains); `/frp mem census` reports BNet peer and exchange counts.
+
+## 0.2.3
+
+### Added
+
+- Fractionalised debug flags: `/frp debug` now lists categories, `/frp debug
+  <category>` toggles one (broadcast, receive, cache, queue, fanout, chunks,
+  targets, stats), and `/frp debug all` toggles everything. Existing
+  `debug = true` settings migrate to `all`.
+- `/frp debug chunks` logs every wire chunk in and out (very noisy).
+- Pinned whisper targets (`/frp debug target`) are now gated on the `targets`
+  category rather than the global debug switch.
+- Session-only traffic statistics while the `stats` category is enabled:
+  message rates (rolling 60s + session), byte sizes (average and median),
+  profile reassembly time (first to last chunk), per-leg transmit time,
+  per-medium and per-leg breakdowns, cache outcome and error tallies, queue
+  high-water marks, origin age, unique senders/subjects, and a 50-entry
+  recent-message ring buffer. Inspect with `/frp stats [section|last n|reset]`
+  or `ns.Stats.snapshot()`.
+- `/frp mem` memory diagnostics: forced-GC live memory reading, `churn [n]`
+  allocation-rate sampling, and `census` live counts of the internal tables.
+- `Util.newPool` shared table-pool primitive (acquire/release/size).
+- `/frp relays` inspects relay selection: learned relays/contacts, online
+  roster candidates, and the last fanout's chosen targets per leg. The
+  `fanout` debug category now prints the picked names, not just counts.
+- Roster rebuilds are gated on `C_Club.ClubsHaveBeenLoaded`, and a build
+  that collected GUIDs but saw no faction values (member info still
+  streaming) is discarded and retried after `C.ROSTER_RETRY` seconds
+  instead of publishing an empty-faction roster for a whole memo window.
+- The send queue is bounded at `C.SEND_QUEUE_CAP` (384) chunks: a leg that
+  cannot fit entirely is dropped whole (per-leg atomic), counted under
+  `send_queue_drop` in `/frp stats errors`. Prevents unbounded backlog
+  when outbound demand exceeds the ~15/s drain capacity.
+
+### Changed
+
+- Allocation-churn reduction across the hot paths (measured via `/frp mem
+  churn`; the 40 MB sawtooth was garbage backlog, not leaks):
+  - The send queue now holds pooled descriptor records instead of a closure
+    per chunk, ring-indexed (no `table.remove` shifts); per-leg completion is
+    flat fields on the last descriptor rather than a `legDone` closure.
+  - Inbound transport contexts are persistent scratch tables (reused per
+    event, never retained past the synchronous handler).
+  - `ChunkReassembler` buffers key two-level by sender→msgId (no per-chunk
+    key concat), parse headers positionally, pool buffer/piece tables, and
+    return metadata as multiple return values instead of a meta table.
+  - `parseMessage`/`buildMessage`/`chunk` avoid split/join tables and
+    `string.format`.
+  - Fanout: the five per-call closures are hoisted to methods/file-locals;
+    leg candidate lists, seen-maps and sent-key sets are wiped shared
+    scratch; `commUsage` entries reset in place on window expiry; the
+    Battle.net account list is memoized (`C.BNET_MEMO` = 15s) instead of a
+    per-fanout friends-list scan.
+  - The club roster rebuild writes into a persistent back buffer and swaps
+    atomically, so the 45s rebuild no longer re-allocates O(roster) tables;
+    the per-slice timer closure is hoisted.
+  - `receivedPending` records are pooled; `injectOrder` is ring-indexed;
+    `guidMemo` entries reset in place; TRP3 injection unrolls its section
+    map; the stats recent ring reuses entry slots.
+  - Disabled debug/stats paths remain a single nil-guarded lookup.
+
+- Debug log hooks and stats recorders are installed/removed with their flags
+  instead of checking flags per call, so disabled debug facilities cost a
+  single nil-guarded table lookup at each call site.
+- `ChunkReassembler:add` now returns reassembly metadata (chunk count,
+  first-to-last-chunk elapsed, duplicate arrivals) alongside the completed
+  message, and `prune` returns the number of dropped buffers.
+
 ## 0.2.2
 
 ### Added

@@ -1,9 +1,10 @@
 -- Scanner.lua
 --
--- Watches for player "selection" (mouseover / target) and originates a
--- broadcast of the selected player's profile. We only originate for units the
--- RP AddOn has *authoritative* data for: the local player and same-faction
--- players. Opposite-faction units are display-only (see Tooltip).
+-- Watches for player "selection" (mouseover / target). Same-faction and own
+-- profiles are extracted and *published to the local cache* (Broadcast:publish
+-- — no wire traffic) so we can serve them when a peer asks. Selecting an
+-- opposite-faction unit is the pull trigger: requestProfile asks the mesh
+-- for that subject.
 --
 -- Because the RP AddOn fetches a freshly-seen same-faction profile
 -- asynchronously, we also listen for the adapter's "profile updated" signal and
@@ -34,11 +35,12 @@ function Scanner:init()
 	self.selected = {}
 
 	-- Profiles reported as received over the RP AddOn's own comm channels,
-	-- queued for re-broadcast. receivedPending maps unitID -> { adapter,
-	-- readyAt }; receivedQueue is the FIFO order, capped so sustained receipt
-	-- bursts cannot flood the send queue.
+	-- queued for re-broadcast. receivedPending maps unitID -> pooled
+	-- { adapter, readyAt } record; receivedQueue is the FIFO order, capped so
+	-- sustained receipt bursts cannot flood the send queue.
 	self.receivedPending = {}
 	self.receivedQueue = {}
+	self.pendingAcquire, self.pendingRelease = ns.Util.newPool(C.RECEIVED_ORIGIN_QUEUE)
 
 	-- Last content version we originated per unit ID. Used to collapse
 	-- update-event feedback (see header comment) to a no-op.
@@ -96,7 +98,16 @@ function Scanner:onSelect(unit)
 	end
 	-- Opposite-faction players have no authoritative local data to originate;
 	-- they are enriched for display only (Tooltip module).
+	-- Opposite-faction players have no authoritative local data: this is the
+	-- pull-exchange trigger — ask the mesh for their profile (deduped and
+	-- rate-limited inside requestProfile).
 	if ns.Util.isOppositeFaction(unit) then
+		local adapter = ns.getAvailableAdapter()
+		local unitID = adapter and adapter:getUnitID(unit)
+		local guid = UnitGUID(unit)
+		if guid then
+			ns.broadcast:requestProfile(guid, unitID)
+		end
 		return
 	end
 	local adapter = ns.getAvailableAdapter()
@@ -146,8 +157,14 @@ function Scanner:onAdapterReceived(adapter, unitID)
 		return
 	end
 
-	self.receivedPending[unitID] = { adapter = adapter, readyAt = readyAt }
+	local pending = self.pendingAcquire()
+	pending.adapter = adapter
+	pending.readyAt = readyAt
+	self.receivedPending[unitID] = pending
 	self.receivedQueue[#self.receivedQueue + 1] = unitID
+	if ns.statsQueueDepth then
+		ns.statsQueueDepth("received", #self.receivedQueue)
+	end
 	if ns.debugReceived then
 		ns.debugReceived(unitID)
 	end
@@ -162,7 +179,14 @@ function Scanner:onAdapterReceived(adapter, unitID)
 	-- Bound the queue; the oldest pending receipts are the least valuable.
 	while #self.receivedQueue > C.RECEIVED_ORIGIN_QUEUE do
 		local dropped = table.remove(self.receivedQueue, 1)
+		local p = self.receivedPending[dropped]
 		self.receivedPending[dropped] = nil
+		if p then
+			self.pendingRelease(p)
+		end
+		if ns.statsError then
+			ns.statsError("received_queue_drop")
+		end
 		if ns.debugSkip then
 			ns.debugSkip(dropped, "received queue full")
 		end
@@ -184,11 +208,17 @@ function Scanner:drainReceived()
 			self.receivedPending[unitID] = nil
 
 			local adapter = pending.adapter
+			self.pendingRelease(pending)
 			local guid = adapter and adapter:isAvailable() and ns.Util.resolveGUID(unitID)
 			if guid then
 				self:share(adapter, unitID, guid)
-			elseif ns.debugSkip then
-				ns.debugSkip(unitID, "could not resolve GUID")
+			else
+				if ns.statsError then
+					ns.statsError("guid_unresolved")
+				end
+				if ns.debugSkip then
+					ns.debugSkip(unitID, "could not resolve GUID")
+				end
 			end
 			return -- at most one per tick
 		else
@@ -212,7 +242,7 @@ function Scanner:share(adapter, unitID, guid)
 		return -- nothing new since our last originate (e.g. our own injection)
 	end
 	self.lastSharedVersion[unitID] = profile.contentVersion
-	ns.broadcast:originate(guid, unitID, profile)
+	ns.broadcast:publish(guid, unitID, profile)
 end
 
 -- Singleton.

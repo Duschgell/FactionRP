@@ -12,7 +12,12 @@ ns.Const = C
 -- Identity -----------------------------------------------------------------
 
 C.ADDON_NAME = "FactionRP"
-C.VERSION = "0.2.1"
+C.VERSION = "0.3.0"
+
+-- Wire-protocol generation. Stamped into every envelope and the comm-channel
+-- name; peers advertising a lower PROTO_MAJOR are rejected outright, so each
+-- incompatible protocol change gets a hard partition (bump this).
+C.PROTO_MAJOR = 3
 
 -- Communication -------------------------------------------------------------
 
@@ -21,8 +26,9 @@ C.VERSION = "0.2.1"
 C.MSG_PREFIX = "FactionRP"
 
 -- Name of the hidden chat channel used to relay messages between same-faction
--- clients (joined via JoinTemporaryChannel).
-C.COMM_CHANNEL = "FactionRP"
+-- clients (joined via JoinTemporaryChannel). Carries the protocol generation
+-- so older-protocol clients sit on a disjoint channel and never interop.
+C.COMM_CHANNEL = "frp" .. C.PROTO_MAJOR .. "comms" -- e.g. "frp3comms"
 
 -- Field separator used inside a logical message payload. `||` is chosen
 -- because it virtually never appears in serialized profile data.
@@ -33,21 +39,81 @@ C.SEPARATOR = "||"
 -- bytes per chunk below this value.
 C.CHUNK_SIZE = 220
 
--- Outbound send pacing. To avoid the client silently dropping messages under
--- its own throttle, we release at most SEND_BURST queued messages every
--- SEND_INTERVAL seconds rather than sending in one burst.
+-- Outbound send pacing. THE outbound rate dial: SEND_RATE chunks per second,
+-- released on a SEND_INTERVAL tick via a fractional token bucket (credit
+-- accumulates at SEND_RATE*SEND_INTERVAL per tick, capped at SEND_RATE so an
+-- idle queue cannot bank an unbounded burst). Dial the whole send rate by
+-- editing this one number.
 C.SEND_INTERVAL = 0.2
-C.SEND_BURST = 3
+C.SEND_RATE = 7.5
+
+-- Cap on the reusable send-descriptor pool (the outbound queue stores pooled
+-- record tables instead of closures). Beyond this depth sends simply allocate
+-- — the pool bounds reuse, never work.
+C.POOL_SEND_DESC = 256
+
+-- Hard bound on queued send chunks. Outbound demand (inbound rate x chunks
+-- x legs) can exceed the 15/s drain capacity during bursts, and an unbounded
+-- queue then grows monotonically with every chunk leaving stale. A leg that
+-- cannot fit entirely is dropped whole — dropping individual chunks just
+-- produces an incomplete message at the far end while still wasting the
+-- siblings' sends. ~384 chunks is ~25s of worst-case dwell at the drain rate.
+C.SEND_QUEUE_CAP = 384
+
+-- FRP1 control channel -----------------------------------------------------
+-- Control messages are ordinary 7-field envelopes whose subject is the
+-- reserved CTL_SUBJECT token (a subject is always a player GUID, so "_frp"
+-- can never collide). The data field carries "FRP1 <verb> <arg>": FRP1 is the
+-- control-protocol revision for forward compatibility. Verbs:
+--   HELLO <version>  BNet peer probe ("I run FactionRP")
+--   HI <version>     handshake reply
+--   REQ <subjectGuid>   pull-exchange request: "who has this profile?"
+--   ACK <subjectGuid>   "I can serve it"
+--   OK  <subjectGuid>   grant: "you may send it"
+--   NOK <subjectGuid>   deny: "stand down" (late ACKs)
+-- Control messages are never cached, injected, or relayed.
+C.CTL_SUBJECT = "_frp"
+C.CTL_PROTO = "FRP1"
 
 -- How long (seconds) a partially-received multi-chunk message is kept before a
 -- missing chunk causes it to be discarded.
 C.REASSEMBLY_TIMEOUT = 60
 
--- Relaying to the regular (non-Battle.net) friends list is redundant with the
--- same-faction comm channel: any same-faction friend running the AddOn already
--- receives channel traffic, and connected realms share channels. The capability
--- exists per the design, but is disabled by default to avoid duplicate traffic.
-C.RELAY_TO_FRIENDS = false
+-- How long (seconds) the online Battle.net game-account list is memoized.
+-- Enumerating WoW BNet friends allocates client tables per account, so the
+-- fanout reuses a cached list; gossip tolerates a few seconds of presence
+-- staleness.
+C.BNET_MEMO = 15
+
+-- BNet peer confirmation (FRP1 HELLO/HI handshake). Data legs go only to
+-- confirmed accounts; unconfirmed accounts receive HELLO probes on a rotating
+-- cooldown. BNET_PROBE_MAX unanswered probes mark the account ignored for
+-- BNET_IGNORE_TTL seconds (cleared early by friend-presence events).
+-- A confirmation expires BNET_CONFIRM_TTL seconds after the peer's last
+-- inbound proof, so a friend who stops running FactionRP decays back to
+-- probe status on its own.
+C.BNET_CONFIRM_TTL = 600
+C.BNET_PROBE_INTERVAL = 10  -- probe ticker cadence (>=1 probe per tick)
+C.BNET_PROBE_COOLDOWN = 45  -- per-account gap between probes
+C.BNET_PROBE_MAX = 3        -- unanswered probes before ignoring
+C.BNET_IGNORE_TTL = 1800    -- ignore-list decay
+C.BNET_HI_COOLDOWN = 30     -- min gap between HI replies to the same account
+
+-- Senders whose messages fail the protocol/malformed gates are blocked at
+-- chunk level for this long: their chunks are dropped before reassembly, so
+-- old-protocol peers cannot burn our inbound processing. Decays so a peer
+-- that upgrades mid-session recovers automatically.
+C.REJECTED_SENDER_TTL = 300
+
+-- Pull exchange (REQ -> ACK -> OK -> data, NOK for losers). Timeouts bound a
+-- pending request; REQ_COOLDOWN keeps repeated sightings of the same subject
+-- from re-requesting a profile nobody could serve.
+C.REQ_ACK_TIMEOUT = 15   -- open request expires without an ACK
+C.REQ_DATA_TIMEOUT = 30  -- granted request expires without data
+C.REQ_COOLDOWN = 60      -- min gap between requests for the same subject
+C.REQ_MAX_PENDING = 32   -- bound on outstanding requests
+C.SERVE_PENDING_CAP = 16 -- bound on granted-or-awaiting serves per peer+subject
+C.SERVE_TIMEOUT = 30     -- pending serve expires without an OK
 
 -- Caching -------------------------------------------------------------------
 
@@ -84,14 +150,14 @@ C.GUID_RESOLVE_MEMO = 60
 -- Community relays (cross-faction) ------------------------------------------
 --
 -- Opposite-faction members of our own WoW communities are reachable by addon
--- whisper, so every broadcast also fans out to a capped set of them. Whispers
--- are the costliest leg, so the cap is deliberately small — a few seeded peers
--- flood their own faction side, so wide fanout is unnecessary.
-C.COMM_RELAY_LIMIT = 3
+-- whisper, so profile REQUESTs fan out to a capped rotating set of them.
+-- Under the pull model these legs carry single-chunk control messages, not
+-- full profile data, so the cap can be generous.
+C.COMM_RELAY_LIMIT = 10
 
 -- The guild is a second, independent whisper leg (cross-faction guilds exist):
 -- its own capped target list on top of the community one.
-C.GUILD_RELAY_LIMIT = 3
+C.GUILD_RELAY_LIMIT = 10
 
 -- No single member should act as a relay server: each contact may be used at
 -- most COMM_USAGE_LIMIT times per COMM_USAGE_WINDOW seconds. Exhausted
@@ -107,11 +173,43 @@ C.COMM_USAGE_WINDOW = 60
 C.COMM_ROSTER_MEMO = 45
 C.ROSTER_SLICE = 40
 
+-- Club member data (notably `faction`) streams in lazily. A rebuild that
+-- collected GUIDs but saw no faction values is assumed to have raced the
+-- stream: it is not published, and a retry is scheduled this many seconds
+-- out instead of waiting a full memo window.
+C.ROSTER_RETRY = 5
+
 -- Injection into the RP AddOn's register (populating its directory as gossip
 -- arrives) is queued: register writes fire the AddOn's own update/UI events,
 -- so bursts are amortized at INJECT_BURST entries per INJECT_INTERVAL.
 C.INJECT_INTERVAL = 0.5
 C.INJECT_BURST = 2
+
+-- Debug & statistics ---------------------------------------------------------
+--
+-- Debug output is fractionalised into independently-toggleable categories
+-- (ns.db.debug[category]); the `all` flag overrides every category. This is
+-- the canonical, ordered list a future settings UI can enumerate — `all` is
+-- deliberately absent (it is an override, not a category).
+C.DEBUG_CATEGORIES = {
+
+	{ key = "receive",   desc = "Log each fully-received inbound message" },
+	{ key = "cache",     desc = "Log cache store/update/refresh results" },
+	{ key = "queue",     desc = "Log received-profile queueing and skips" },
+	{ key = "fanout",    desc = "Log per-leg whisper fanout counts" },
+	{ key = "chunks",    desc = "Log every wire chunk in/out (very noisy)" },
+	{ key = "targets",   desc = "Allow pinned whisper targets to send" },
+	{ key = "peers",     desc = "Log BNet probe/confirm and REQ exchange events" },
+	{ key = "stats",     desc = "Collect traffic statistics (/frp stats)" },
+}
+
+-- Statistics collection is session-only and bounded: reservoirs cap how many
+-- samples are kept for median/inspection, and rates use a bucketed ring so
+-- memory stays flat regardless of session length.
+C.STATS_RESERVOIR = 256 -- samples kept for median size/duration queries
+C.STATS_RECENT = 50     -- per-message records kept in the recent ring buffer
+C.STATS_RATE_WINDOW = 60 -- seconds covered by the rolling rate window
+C.STATS_RATE_BUCKETS = 12 -- buckets the window is divided into
 
 -- Profiles ------------------------------------------------------------------
 

@@ -61,6 +61,8 @@ end
 -- MSP-sourced profiles (non-TRP3 RP addons) lack .v counters; TRP3 instead
 -- tracks per-field CRC versions in profile.mspver. We fold them in as a sorted
 -- suffix so MSP updates still produce a distinct content version.
+local mspFields = {} -- scratch: refilled per buildContentVersion call
+
 local function buildContentVersion(sections, mspver)
 	local function v(section)
 		return (section and section.v) or 0
@@ -72,13 +74,17 @@ local function buildContentVersion(sections, mspver)
 		v(sections.misc)
 	)
 	if mspver then
-		local fields = {}
+		local n = 0
 		for field, ver in pairs(mspver) do
-			fields[#fields + 1] = tostring(field) .. "=" .. tostring(ver)
+			n = n + 1
+			mspFields[n] = tostring(field) .. "=" .. tostring(ver)
 		end
-		if #fields > 0 then
-			table.sort(fields)
-			version = version .. "|msp:" .. table.concat(fields, ",")
+		for i = #mspFields, n + 1, -1 do
+			mspFields[i] = nil
+		end
+		if n > 0 then
+			table.sort(mspFields)
+			version = version .. "|msp:" .. table.concat(mspFields, ",")
 		end
 	end
 	return version
@@ -151,6 +157,22 @@ function TRP3Adapter:extract(unitID)
 	}
 end
 
+--- Cheap "could we serve this unit's profile" check for the pull exchange:
+-- true when TRP3 holds a profile for the unit (or it is us). Does not
+-- extract — the expensive copy only runs once a request is granted.
+function TRP3Adapter:canServe(unitID)
+	if not unitID or not self:isAvailable() then
+		return false
+	end
+	if unitID == TRP3_API.globals.player_id then
+		return TRP3_API.profile.getPlayerCurrentProfileID() ~= nil
+	end
+	local reg = TRP3_API.register
+	return reg.isUnitIDKnown(unitID)
+		and reg.hasProfile(unitID)
+		and reg.getUnitIDProfileID(unitID) ~= nil
+end
+
 --- Inject a received profile into TRP3's register so TRP3 renders it.
 -- Mirrors the sequence TRP3 itself uses when receiving a profile.
 -- @return boolean Whether anything was injected.
@@ -175,22 +197,23 @@ function TRP3Adapter:inject(unitID, data, classID)
 	reg.saveCurrentProfileID(unitID, data.profileID)
 
 	-- Write each present section, skipping ones TRP3 already holds at the same
-	-- version to avoid redundant writes and update events.
-	local sectionByType = {
-		[types.CHARACTERISTICS] = data.sections.characteristics,
-		[types.CHARACTER] = data.sections.character,
-		[types.MISC] = data.sections.misc,
-	}
+	-- version to avoid redundant writes and update events (unrolled: the
+	-- section map would be a per-call allocation for only three entries).
 	local injected = false
-	for infoType, section in pairs(sectionByType) do
-		if section then
-			local version = section.v
-			-- shouldUpdateInformation is safe now that the profile is bound.
-			if reg.shouldUpdateInformation(unitID, infoType, version) then
-				reg.saveInformation(unitID, infoType, section)
-				injected = true
-			end
-		end
+	local section = data.sections.characteristics
+	if section and reg.shouldUpdateInformation(unitID, types.CHARACTERISTICS, section.v) then
+		reg.saveInformation(unitID, types.CHARACTERISTICS, section)
+		injected = true
+	end
+	section = data.sections.character
+	if section and reg.shouldUpdateInformation(unitID, types.CHARACTER, section.v) then
+		reg.saveInformation(unitID, types.CHARACTER, section)
+		injected = true
+	end
+	section = data.sections.misc
+	if section and reg.shouldUpdateInformation(unitID, types.MISC, section.v) then
+		reg.saveInformation(unitID, types.MISC, section)
+		injected = true
 	end
 	return injected
 end
