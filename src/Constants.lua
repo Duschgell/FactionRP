@@ -12,7 +12,7 @@ ns.Const = C
 -- Identity -----------------------------------------------------------------
 
 C.ADDON_NAME = "FactionRP"
-C.VERSION = "0.2.1"
+C.VERSION = "0.2.3"
 
 -- Communication -------------------------------------------------------------
 
@@ -112,6 +112,31 @@ C.ROSTER_SLICE = 40
 -- so bursts are amortized at INJECT_BURST entries per INJECT_INTERVAL.
 C.INJECT_INTERVAL = 0.5
 C.INJECT_BURST = 2
+
+-- Debug & statistics ---------------------------------------------------------
+--
+-- Debug output is fractionalised into independently-toggleable categories
+-- (ns.db.debug[category]); the `all` flag overrides every category. This is
+-- the canonical, ordered list a future settings UI can enumerate — `all` is
+-- deliberately absent (it is an override, not a category).
+C.DEBUG_CATEGORIES = {
+	{ key = "broadcast", desc = "Log each originated broadcast" },
+	{ key = "receive",   desc = "Log each fully-received inbound message" },
+	{ key = "cache",     desc = "Log cache store/update/refresh results" },
+	{ key = "queue",     desc = "Log received-profile queueing and skips" },
+	{ key = "fanout",    desc = "Log per-leg whisper fanout counts" },
+	{ key = "chunks",    desc = "Log every wire chunk in/out (very noisy)" },
+	{ key = "targets",   desc = "Allow pinned whisper targets to send" },
+	{ key = "stats",     desc = "Collect traffic statistics (/frp stats)" },
+}
+
+-- Statistics collection is session-only and bounded: reservoirs cap how many
+-- samples are kept for median/inspection, and rates use a bucketed ring so
+-- memory stays flat regardless of session length.
+C.STATS_RESERVOIR = 256 -- samples kept for median size/duration queries
+C.STATS_RECENT = 50     -- per-message records kept in the recent ring buffer
+C.STATS_RATE_WINDOW = 60 -- seconds covered by the rolling rate window
+C.STATS_RATE_BUCKETS = 12 -- buckets the window is divided into
 
 -- Profiles ------------------------------------------------------------------
 

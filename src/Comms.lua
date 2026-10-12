@@ -52,7 +52,10 @@ function Comms:start()
 		self:flushQueue()
 	end)
 	self.pruneTicker = C_Timer.NewTicker(C.REASSEMBLY_TIMEOUT / 2, function()
-		self.assembler:prune(C.REASSEMBLY_TIMEOUT)
+		local dropped = self.assembler:prune(C.REASSEMBLY_TIMEOUT)
+		if dropped > 0 and ns.statsPruned then
+			ns.statsPruned(dropped)
+		end
 	end)
 end
 
@@ -91,6 +94,9 @@ end
 --- Queue a send closure for paced delivery.
 function Comms:enqueue(fn)
 	self.queue[#self.queue + 1] = fn
+	if ns.statsQueue then
+		ns.statsQueue(#self.queue)
+	end
 end
 
 --- Release up to SEND_BURST queued sends. Invoked on a timer.
@@ -115,8 +121,20 @@ end
 -- C_ChatInfo.SendAddonMessage bursts from the queue can stall other add-ons'
 -- queued CHANNEL messages (notably TRP3's C_SCAN map-scan requests, which are
 -- sent unthrottled at scan time and are sensitive to chat-frame send backoff).
-function Comms:sendAddon(text, kind, target)
+-- @param onSent function? Optional callback invoked when the chunk is
+--   dequeued for sending (used to time a message's drain per leg).
+function Comms:sendAddon(text, kind, target, onSent)
+	local enqueuedAt = GetTime()
 	self:enqueue(function()
+		if ns.statsChunkOut then
+			ns.statsChunkOut(kind, #text, GetTime() - enqueuedAt)
+		end
+		if ns.debugChunk then
+			ns.debugChunk("out", kind, target, #text)
+		end
+		if onSent then
+			onSent()
+		end
 		local chomp = AddOn_Chomp
 		if chomp and chomp.SendAddonMessage then
 			chomp.SendAddonMessage(self.prefix, text, kind, target, "LOW")
@@ -129,8 +147,18 @@ function Comms:sendAddon(text, kind, target)
 end
 
 --- Send one raw chunk to a Battle.net game account.
-function Comms:sendBNet(text, gameAccountID)
+function Comms:sendBNet(text, gameAccountID, onSent)
+	local enqueuedAt = GetTime()
 	self:enqueue(function()
+		if ns.statsChunkOut then
+			ns.statsChunkOut("BNET", #text, GetTime() - enqueuedAt)
+		end
+		if ns.debugChunk then
+			ns.debugChunk("out", "BNET", gameAccountID, #text)
+		end
+		if onSent then
+			onSent()
+		end
 		local chomp = AddOn_Chomp
 		if chomp and chomp.BNSendGameData then
 			chomp.BNSendGameData(gameAccountID, self.prefix, text, "LOW")
@@ -143,16 +171,36 @@ function Comms:sendBNet(text, gameAccountID)
 end
 
 -- Convenience: send a list of chunks over a single medium ------------------
+-- The final chunk's send closure carries a completion marker so the stats
+-- collector can time how long a full message took to drain to this leg.
+
+local function legDone(startedAt, bytes, kind, target, total)
+	return function()
+		if ns.statsOutLeg then
+			ns.statsOutLeg(kind, target, bytes, total, GetTime() - startedAt)
+		end
+	end
+end
 
 function Comms:sendChunksAddon(chunks, kind, target)
-	for i = 1, #chunks do
-		self:sendAddon(chunks[i], kind, target)
+	local n = #chunks
+	local bytes, startedAt = 0, GetTime()
+	for i = 1, n do
+		bytes = bytes + #chunks[i]
+	end
+	for i = 1, n do
+		self:sendAddon(chunks[i], kind, target, i == n and legDone(startedAt, bytes, kind, target, n) or nil)
 	end
 end
 
 function Comms:sendChunksBNet(chunks, gameAccountID)
-	for i = 1, #chunks do
-		self:sendBNet(chunks[i], gameAccountID)
+	local n = #chunks
+	local bytes, startedAt = 0, GetTime()
+	for i = 1, n do
+		bytes = bytes + #chunks[i]
+	end
+	for i = 1, n do
+		self:sendBNet(chunks[i], gameAccountID, i == n and legDone(startedAt, bytes, "BNET", gameAccountID, n) or nil)
 	end
 end
 
@@ -230,9 +278,20 @@ end
 function Comms:handleIncoming(chunkString, context)
 	-- Reassembly is keyed by a stable per-sender identity.
 	local senderKey = context.senderName or ("bn:" .. tostring(context.gameAccountID))
-	local full = self.assembler:add(senderKey, chunkString)
-	if full and self.messageHandler then
-		self.messageHandler(full, context)
+	if ns.statsChunkIn then
+		ns.statsChunkIn(context.medium, #chunkString)
+	end
+	if ns.debugChunk then
+		ns.debugChunk("in", context.medium, senderKey, #chunkString)
+	end
+	local full, meta = self.assembler:add(senderKey, chunkString)
+	if full then
+		if ns.statsIn then
+			ns.statsIn(full, senderKey, context.medium, meta)
+		end
+		if self.messageHandler then
+			self.messageHandler(full, context)
+		end
 	end
 end
 

@@ -1,42 +1,48 @@
 -- Debug.lua
 --
--- Optional verbose logging, toggled with "/factionrp debug". When enabled, the
--- four lifecycle events called out in the README are printed: a broadcast sent
--- (with subject GUID), a message received (with sender GUID), and a profile
--- stored or refreshed in the cache.
+-- Optional verbose logging, fractionalised into the categories listed in
+-- Const.DEBUG_CATEGORIES. Each is toggled independently with
+-- "/factionrp debug <category>", or all at once with "/factionrp debug all".
+-- The flags live in saved variables as ns.db.debug = { all=bool, <cat>=bool }.
 --
--- The logging entry points (ns.debugBroadcast / ns.debugReceive / ns.debugStore /
--- ns.debugReceived / ns.debugSkip / ns.debugFanout) are called from Broadcast and
--- Scanner behind nil-guards, so this module is purely additive.
+-- Rather than checking flags inside the logging functions, enabled hooks are
+-- *installed* onto ns (ns.debugBroadcast, ns.debugReceive, ...) and disabled
+-- ones removed. Call sites in Broadcast/Scanner/Comms are nil-guarded
+-- ("if ns.debugBroadcast then"), so a disabled category costs a single table
+-- lookup and an enabled one runs with zero flag checks. ns.refreshDebugHooks
+-- re-applies the installation whenever flags change.
+--
+-- The "targets" category has no log hook of its own: it gates whether pinned
+-- whisper targets ("/frp debug target") actually send — Broadcast queries it
+-- through ns.debugEnabled.
 
 local _, ns = ...
 local C = ns.Const
 
-local function enabled()
-	return ns.db and ns.db.debug
+--- Whether a debug category is currently enabled (directly or via `all`).
+-- This is the general query for flag state (used by Broadcast for the
+-- `targets` gate and by Stats for its collector); the log hooks themselves
+-- are installed/removed instead of querying per call.
+-- @param category string One of Const.DEBUG_CATEGORIES keys.
+-- @return boolean
+function ns.debugEnabled(category)
+	local d = ns.db and ns.db.debug
+	return d ~= nil and (d.all or d[category]) == true
 end
 
---- Log: a broadcast was sent for the given subject.
-function ns.debugBroadcast(subjectGUID)
-	if not enabled() then
-		return
-	end
+-- Log hook implementations ---------------------------------------------------
+-- Each implementation is stored next to the category that gates it; the
+-- installer below publishes them under their ns.* names while enabled.
+
+local function logBroadcast(subjectGUID)
 	ns.Print("|cffffd200[broadcast]|r sent profile for " .. tostring(subjectGUID))
 end
 
---- Log: a message was received from the given sender (about a subject).
-function ns.debugReceive(senderGUID, subjectGUID)
-	if not enabled() then
-		return
-	end
+local function logReceive(senderGUID, subjectGUID)
 	ns.Print(("|cff66ccff[received]|r from %s (subject %s)"):format(tostring(senderGUID), tostring(subjectGUID)))
 end
 
---- Log: the cache stored/updated/refreshed an entry. Mirrors Cache.RESULT.
-function ns.debugStore(result, guid)
-	if not enabled() then
-		return
-	end
+local function logStore(result, guid)
 	local R = ns.Cache.RESULT
 	if result == R.NEW then
 		ns.Print("|cff33ff66[cache]|r stored " .. tostring(guid))
@@ -48,33 +54,56 @@ function ns.debugStore(result, guid)
 	-- REJECTED (stale) entries are intentionally not logged to avoid noise.
 end
 
---- Log: the RP AddOn reported a network-received profile; it was queued for
---- re-broadcast after the debounce/jitter delay.
-function ns.debugReceived(unitID)
-	if not enabled() then
-		return
-	end
+local function logReceived(unitID)
 	ns.Print("|cff66ccff[received]|r profile data for " .. tostring(unitID) .. " (queued)")
 end
 
---- Log: a pending re-broadcast was skipped (unresolvable GUID, queue drop).
-function ns.debugSkip(unitID, reason)
-	if not enabled() then
-		return
-	end
+local function logSkip(unitID, reason)
 	ns.Print(("|cffffd200[skip]|r %s (%s)"):format(tostring(unitID), tostring(reason)))
 end
 
---- Log: a fanout sent cross-faction whispers per leg (community, guild) plus
---- any pinned debug targets.
-function ns.debugFanout(community, guild, pinned)
-	if not enabled() then
-		return
-	end
+local function logFanout(community, guild, pinned)
 	ns.Print(("|cffffd200[broadcast]|r whispers: %d community, %d guild, %d pinned"):format(
 		community, guild, pinned or 0
 	))
 end
+
+local function logChunk(direction, medium, peer, bytes)
+	ns.Print(("|cff8888ff[chunk]|r %s %s %s (%dB)"):format(
+		direction, tostring(medium), tostring(peer or ""), bytes
+	))
+end
+
+-- [ns.* hook name] = { category, implementation }
+local HOOKS = {
+	debugBroadcast = { "broadcast", logBroadcast },
+	debugReceive   = { "receive",   logReceive },
+	debugStore     = { "cache",     logStore },
+	debugReceived  = { "queue",     logReceived },
+	debugSkip      = { "queue",     logSkip },
+	debugFanout    = { "fanout",    logFanout },
+	debugChunk     = { "chunks",    logChunk },
+}
+
+--- Install enabled log hooks onto ns and remove disabled ones. Also refreshes
+-- the stats collector (Stats.lua exposes applyStatsHooks for the same
+-- install/uninstall pattern). Safe to call before saved variables load.
+function ns.refreshDebugHooks()
+	for name, hook in pairs(HOOKS) do
+		ns[name] = ns.debugEnabled(hook[1]) and hook[2] or nil
+	end
+	if ns.applyStatsHooks then
+		ns.applyStatsHooks()
+	end
+end
+
+-- Apply once saved variables are ready (Core's ADDON_LOADED handler is
+-- registered first, so ns.db is already populated/normalised here).
+ns.RegisterEvent("ADDON_LOADED", function(_, loaded)
+	if loaded == ns.name then
+		ns.refreshDebugHooks()
+	end
+end)
 
 local function mapSize(t)
 	local n = 0
@@ -91,7 +120,7 @@ ns.RegisterCommand("purge", function()
 	ns.Print("cache purged (" .. n .. " entries dropped)")
 end, "Empty the profile cache (testing)")
 
--- /factionrp debug [target] --------------------------------------------------
+-- /factionrp debug [category|all|target] -------------------------------------
 
 local function handleTarget(arg)
 	arg = arg and ns.Util.trim(arg) or ""
@@ -110,26 +139,78 @@ local function handleTarget(arg)
 	end
 end
 
+local function flagText(on)
+	return on and "|cff33ff66on|r" or "|cffff5555off|r"
+end
+
+--- Print the current state of every debug category plus the `all` override.
+local function printFlags()
+	local d = ns.db.debug
+	ns.Print("debug flags (" .. flagText(d.all) .. " = all):")
+	for _, cat in ipairs(C.DEBUG_CATEGORIES) do
+		ns.Print(("  %s: %s - %s"):format(cat.key, flagText(d.all or d[cat]), cat.desc))
+	end
+end
+
+local function setFlag(key, on)
+	ns.db.debug[key] = on
+	ns.refreshDebugHooks()
+	ns.Print(("debug |cff66ccff%s|r %s"):format(key, flagText(ns.db.debug[key])))
+end
+
 ns.RegisterCommand("debug", function(arg)
 	if not ns.db then
 		return
 	end
 	-- "/frp debug target ..." manages pinned whisper targets; bare "/frp debug"
-	-- toggles debug mode.
+	-- lists flag states; "all"/<category> toggle individual flags.
 	local sub, rest = arg and arg:match("^(%S*)%s*(.-)$") or "", ""
-	if sub:lower() == "target" then
+	sub = sub:lower()
+	if sub == "target" then
 		handleTarget(rest)
 		return
 	end
-	ns.db.debug = not ns.db.debug
-	ns.Print("debug mode " .. (ns.db.debug and "|cff33ff66ON|r" or "|cffff5555OFF|r"))
-end, "Toggle verbose debug output; 'target <name>' pins a whisper test target")
+	if sub == "" then
+		printFlags()
+		return
+	end
+	if sub == "all" then
+		rest = ns.Util.trim(rest or ""):lower()
+		local on = (rest == "") and not ns.db.debug.all or (rest == "on" or rest == "true" or rest == "1")
+		setFlag("all", on)
+		return
+	end
+	for _, cat in ipairs(C.DEBUG_CATEGORIES) do
+		if cat.key == sub then
+			setFlag(sub, not ns.db.debug[sub])
+			return
+		end
+	end
+	ns.Print("unknown debug category '" .. sub .. "'; valid: all, " .. table.concat((function()
+		local keys = {}
+		for _, cat in ipairs(C.DEBUG_CATEGORIES) do
+			keys[#keys + 1] = cat.key
+		end
+		return keys
+	end)(), ", ") .. ", target")
+end, "List debug flags; '<category>' toggles one, 'all' toggles all, 'target <name>' pins a whisper test target")
 
 -- Richer status command (overrides the placeholder registered in Core).
 ns.RegisterCommand("status", function()
 	local adapter = ns.getAvailableAdapter()
 	local relays = ns.broadcast and mapSize(ns.broadcast.knownRelays) or 0
 	local contacts = ns.broadcast and mapSize(ns.broadcast.xfacContacts) or 0
+	local enabledCats = {}
+	local d = ns.db and ns.db.debug
+	if d and d.all then
+		enabledCats[1] = "all"
+	elseif d then
+		for _, cat in ipairs(C.DEBUG_CATEGORIES) do
+			if d[cat.key] then
+				enabledCats[#enabledCats + 1] = cat.key
+			end
+		end
+	end
 	ns.Print(("version %s | cache: %d | pending: %d | send queue: %d | relays: %d | contacts: %d | RP adapter: %s | debug: %s"):format(
 		C.VERSION,
 		ns.cache and ns.cache:count() or 0,
@@ -138,6 +219,6 @@ ns.RegisterCommand("status", function()
 		relays,
 		contacts,
 		adapter and adapter.name or "|cffff5555none|r",
-		(ns.db and ns.db.debug) and "on" or "off"
+		#enabledCats > 0 and table.concat(enabledCats, ",") or "off"
 	))
 end, "Show version, cache size, pending sends, adapter and debug state")

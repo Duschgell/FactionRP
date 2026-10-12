@@ -99,13 +99,17 @@ end
 
 -- Lifecycle -----------------------------------------------------------------
 
--- Saved variables (declared in the .toc). Currently only the debug flag is
+-- Saved variables (declared in the .toc). Currently only the debug flags are
 -- persisted; populated/normalised on ADDON_LOADED.
 ns.RegisterEvent("ADDON_LOADED", function(_, loaded)
 	if loaded ~= addonName then
 		return
 	end
 	FactionRPDB = FactionRPDB or {}
+	-- Migrate the pre-categories boolean: debug = true meant "everything".
+	if type(FactionRPDB.debug) ~= "table" then
+		FactionRPDB.debug = { all = FactionRPDB.debug == true }
+	end
 	ns.db = FactionRPDB
 end)
 

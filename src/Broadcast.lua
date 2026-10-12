@@ -68,12 +68,17 @@ function Broadcast:fanOut(chunks, context)
 	local comms = ns.comms
 	local srcMedium = context and context.medium
 
+	local leg = ns.statsLeg
+
 	-- Same-faction channel: skip if the message already came over the channel
 	-- (every channel member already received it directly).
 	if srcMedium ~= "CHANNEL" then
 		local idx = comms:channelIndex()
 		if idx then
 			comms:sendChunksAddon(chunks, "CHANNEL", idx)
+			if leg then
+				leg("channel", 1)
+			end
 		end
 	end
 
@@ -81,6 +86,9 @@ function Broadcast:fanOut(chunks, context)
 	local groupKind = comms:groupChannel()
 	if groupKind and not isGroupMedium(srcMedium) then
 		comms:sendChunksAddon(chunks, groupKind)
+		if leg then
+			leg("group", 1)
+		end
 	end
 
 	-- Battle.net (cross-faction relays): every eligible account except the one
@@ -90,6 +98,9 @@ function Broadcast:fanOut(chunks, context)
 			return
 		end
 		comms:sendChunksBNet(chunks, gameAccountID)
+		if leg then
+			leg("bnet", 1)
+		end
 	end)
 
 	-- Regular friends: optional (see C.RELAY_TO_FRIENDS), redundant with channel.
@@ -99,6 +110,9 @@ function Broadcast:fanOut(chunks, context)
 				return
 			end
 			comms:sendChunksAddon(chunks, "WHISPER", name)
+			if leg then
+				leg("friends", 1)
+			end
 		end)
 	end
 
@@ -115,10 +129,10 @@ function Broadcast:fanOut(chunks, context)
 
 	-- Pinned debug targets: guaranteed delivery, bypassing leg membership and
 	-- the caps (the echo-skip still applies — never whisper the source back).
-	-- Debug mode only (/frp debug), so normal users cannot defeat the
-	-- round-robin fairness by pinning.
+	-- "targets" debug category only (/frp debug targets), so normal users
+	-- cannot defeat the round-robin fairness by pinning.
 	local sentPinned = 0
-	if ns.db and ns.db.debug then
+	if ns.debugEnabled("targets") then
 		for key, name in pairs(self.forcedTargets) do
 			if key ~= skipName and not sentKeys[key] then
 				sentKeys[key] = true
@@ -216,6 +230,17 @@ function Broadcast:fanOut(chunks, context)
 			C.GUILD_RELAY_LIMIT
 		)
 	end
+	if leg then
+		if sentComm > 0 then
+			leg("community", sentComm)
+		end
+		if sentGuild > 0 then
+			leg("guild", sentGuild)
+		end
+		if sentPinned > 0 then
+			leg("pinned", sentPinned)
+		end
+	end
 	if (sentComm + sentGuild + sentPinned) > 0 and ns.debugFanout then
 		ns.debugFanout(sentComm, sentGuild, sentPinned)
 	end
@@ -232,6 +257,9 @@ end
 function Broadcast:originate(guid, unitID, profile)
 	local encoded = Serializer.encodeProfile(profile.data)
 	if not encoded then
+		if ns.statsError then
+			ns.statsError("encode_fail")
+		end
 		return
 	end
 
@@ -246,6 +274,9 @@ function Broadcast:originate(guid, unitID, profile)
 	local result = ns.cache:tryStore(candidate)
 	if ns.debugStore then
 		ns.debugStore(result, guid)
+	end
+	if ns.statsCache then
+		ns.statsCache(result)
 	end
 	if result ~= ns.Cache.RESULT.NEW and result ~= ns.Cache.RESULT.UPDATED then
 		return -- nothing new to share
@@ -263,7 +294,11 @@ function Broadcast:originate(guid, unitID, profile)
 	if ns.debugBroadcast then
 		ns.debugBroadcast(guid)
 	end
-	self:fanOut(Serializer.chunk(message), nil)
+	local chunks = Serializer.chunk(message)
+	if ns.statsOutMessage then
+		ns.statsOutMessage(#message, #chunks, guid, "originate")
+	end
+	self:fanOut(chunks, nil)
 end
 
 -- Reception -----------------------------------------------------------------
@@ -274,11 +309,17 @@ function Broadcast:onMessage(raw, context)
 	-- Reject malformed messages, including a non-numeric origin-time which would
 	-- otherwise break the Cache's ordering comparison.
 	if not msg or type(msg.originTime) ~= "number" then
+		if ns.statsError then
+			ns.statsError("malformed")
+		end
 		return
 	end
 
 	-- Loop avoidance: ignore our own traffic echoed back to us.
 	if msg.sender == self.playerGUID then
+		if ns.statsError then
+			ns.statsError("self_echo")
+		end
 		return
 	end
 	-- A whispered message from an opposite-faction club member confirms they
@@ -291,6 +332,16 @@ function Broadcast:onMessage(raw, context)
 	end
 	if ns.debugReceive then
 		ns.debugReceive(msg.sender, msg.subject)
+	end
+	if ns.statsPeer then
+		ns.statsPeer(msg.sender, msg.subject)
+	end
+	if ns.statsTagSubject then
+		ns.statsTagSubject(msg.subject)
+	end
+	if ns.statsOriginAge then
+		-- Rough cross-client staleness measure; sender's time() may skew.
+		ns.statsOriginAge(time() - msg.originTime)
 	end
 
 	local candidate = {
@@ -307,6 +358,9 @@ function Broadcast:onMessage(raw, context)
 	if not result then
 		local profileData = Serializer.decodeProfile(msg.data)
 		if not profileData then
+			if ns.statsError then
+				ns.statsError("undecodable")
+			end
 			return -- corrupt or undecodable
 		end
 		candidate.data = profileData
@@ -314,6 +368,9 @@ function Broadcast:onMessage(raw, context)
 	end
 	if ns.debugStore then
 		ns.debugStore(result, msg.subject)
+	end
+	if ns.statsCache then
+		ns.statsCache(result)
 	end
 
 	-- Only relay genuinely new/changed content; this is what converges the flood.
@@ -336,7 +393,11 @@ function Broadcast:onMessage(raw, context)
 		contentVersion = msg.contentVersion,
 		data = msg.data,
 	})
-	self:fanOut(Serializer.chunk(relay), context)
+	local chunks = Serializer.chunk(relay)
+	if ns.statsOutMessage then
+		ns.statsOutMessage(#relay, #chunks, msg.subject, "relay")
+	end
+	self:fanOut(chunks, context)
 end
 
 -- Injection into the RP AddOn ------------------------------------------------
@@ -350,6 +411,9 @@ function Broadcast:queueInject(candidate)
 	end
 	if not self.injectQueue[candidate.guid] then
 		self.injectOrder[#self.injectOrder + 1] = candidate.guid
+		if ns.statsQueueDepth then
+			ns.statsQueueDepth("inject", #self.injectOrder)
+		end
 	end
 	self.injectQueue[candidate.guid] = candidate
 end

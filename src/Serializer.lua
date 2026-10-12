@@ -143,14 +143,17 @@ local ChunkReassembler = ns.Class("ChunkReassembler")
 Serializer.ChunkReassembler = ChunkReassembler
 
 function ChunkReassembler:init()
-	self.buffers = {} -- [sender\031msgId] = { total, count, pieces = {}, time }
+	self.buffers = {} -- [sender\031msgId] = { total, count, dupes, pieces = {}, time }
 end
 
---- Feed one received chunk. Returns the fully reassembled message string once
--- the final missing chunk arrives, otherwise nil.
+--- Feed one received chunk. Once the final missing chunk arrives, returns the
+-- fully reassembled message string plus a metadata table
+--   { chunks = total chunks received, elapsed = seconds first->last chunk,
+--     dupes = duplicate chunk arrivals observed };
+-- otherwise returns nil.
 -- @param sender      string A stable identifier for the sender.
 -- @param chunkString string The raw chunk as received.
--- @return string|nil
+-- @return string|nil, table|nil
 function ChunkReassembler:add(sender, chunkString)
 	local f = Util.split(chunkString, ":", CHUNK_HEADER_FIELDS)
 	if #f < CHUNK_HEADER_FIELDS then
@@ -166,23 +169,29 @@ function ChunkReassembler:add(sender, chunkString)
 
 	-- Single-chunk messages need no buffering.
 	if total == 1 then
-		return piece
+		return piece, { chunks = 1, elapsed = 0, dupes = 0 }
 	end
 
 	local key = sender .. "\031" .. msgId
 	local buf = self.buffers[key]
 	if not buf then
-		buf = { total = total, count = 0, pieces = {}, time = GetTime() }
+		buf = { total = total, count = 0, dupes = 0, pieces = {}, time = GetTime() }
 		self.buffers[key] = buf
 	end
 	if not buf.pieces[index] then
 		buf.pieces[index] = piece
 		buf.count = buf.count + 1
+	else
+		buf.dupes = buf.dupes + 1
 	end
 
 	if buf.count >= buf.total then
 		self.buffers[key] = nil
-		return table.concat(buf.pieces)
+		return table.concat(buf.pieces), {
+			chunks = buf.total,
+			elapsed = GetTime() - buf.time,
+			dupes = buf.dupes,
+		}
 	end
 	return nil
 end
@@ -190,11 +199,15 @@ end
 --- Drop partially-received messages older than `maxAge` seconds, so a lost
 -- chunk cannot leak its buffer forever. Call periodically.
 -- @param maxAge number Seconds.
+-- @return number How many partial buffers were dropped.
 function ChunkReassembler:prune(maxAge)
 	local now = GetTime()
+	local dropped = 0
 	for key, buf in pairs(self.buffers) do
 		if (now - buf.time) > maxAge then
 			self.buffers[key] = nil
+			dropped = dropped + 1
 		end
 	end
+	return dropped
 end

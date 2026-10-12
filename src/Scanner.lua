@@ -148,6 +148,9 @@ function Scanner:onAdapterReceived(adapter, unitID)
 
 	self.receivedPending[unitID] = { adapter = adapter, readyAt = readyAt }
 	self.receivedQueue[#self.receivedQueue + 1] = unitID
+	if ns.statsQueueDepth then
+		ns.statsQueueDepth("received", #self.receivedQueue)
+	end
 	if ns.debugReceived then
 		ns.debugReceived(unitID)
 	end
@@ -163,6 +166,9 @@ function Scanner:onAdapterReceived(adapter, unitID)
 	while #self.receivedQueue > C.RECEIVED_ORIGIN_QUEUE do
 		local dropped = table.remove(self.receivedQueue, 1)
 		self.receivedPending[dropped] = nil
+		if ns.statsError then
+			ns.statsError("received_queue_drop")
+		end
 		if ns.debugSkip then
 			ns.debugSkip(dropped, "received queue full")
 		end
@@ -187,8 +193,13 @@ function Scanner:drainReceived()
 			local guid = adapter and adapter:isAvailable() and ns.Util.resolveGUID(unitID)
 			if guid then
 				self:share(adapter, unitID, guid)
-			elseif ns.debugSkip then
-				ns.debugSkip(unitID, "could not resolve GUID")
+			else
+				if ns.statsError then
+					ns.statsError("guid_unresolved")
+				end
+				if ns.debugSkip then
+					ns.debugSkip(unitID, "could not resolve GUID")
+				end
 			end
 			return -- at most one per tick
 		else
