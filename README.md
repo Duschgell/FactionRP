@@ -222,12 +222,19 @@ Running the base command with no (or an unrecognised) sub-command prints the usa
 * `/factionrp debug` — List the debug categories and their on/off state.
 * `/factionrp debug <category>` — Toggle one debug category (see below).
 * `/factionrp debug all [on|off]` — Toggle every category at once.
+* `/factionrp relays` — Show learned relay state: confirmed FRP whisper
+  relays, proven cross-faction contacts, online roster candidates per leg,
+  and the actual targets chosen by the most recent fanout.
 * `/factionrp debug target [Name-Realm]` — Pin a whisper target that bypasses
   the community/guild selection and caps (testing). `clear` resets; no argument
   lists pins. Only sends while the `targets` category (or `all`) is on.
 * `/factionrp stats [section]` — Show collected traffic statistics (requires
   the `stats` category). Sections: `mediums`, `sizes`, `timing`, `cache`,
   `errors`, `queue`, `last [n]`; `reset` zeroes everything.
+* `/factionrp mem` — Show live addon memory after a forced garbage collection
+  and counter refresh. `churn [n]` samples the allocation rate over n seconds
+  (default 10); `census` counts the suspect internal tables (queues, cache,
+  reassembly buffers, roster maps, memos).
 
 ### Debug Mode
 
@@ -241,7 +248,8 @@ The categories:
 * `receive` — a message is received, including sender GUID
 * `cache` — a profile is stored or refreshed in the cache
 * `queue` — a received RP-AddOn profile is queued for re-broadcast, or skipped
-* `fanout` — a fanout sends community/guild/pinned whispers (per-leg counts)
+* `fanout` — a fanout sends community/guild/pinned whispers (per-leg target
+  names; see also `/frp relays`)
 * `chunks` — every wire chunk sent or received (very noisy)
 * `targets` — allows pinned whisper targets (`/frp debug target`) to send
 * `stats` — collects traffic statistics (see below)
@@ -269,6 +277,15 @@ cannot grow memory):
 
 `/frp stats` prints a summary; the sections drill into each area. The same
 data is available programmatically via `ns.Stats.snapshot()`.
+
+### Memory diagnostics
+
+`/frp mem` forces a collection, refreshes the client-side memory counter and
+reports live (retained) addon memory. `/frp mem churn [n]` then samples the
+uncollected counter once a second: the peak-to-baseline delta approximates
+allocation churn between GC cycles — the figure to watch when judging whether
+hot paths are allocating. `/frp mem census` dumps the live size of every
+internal table that could plausibly grow.
 
 ### Additional Plans
 
