@@ -18,8 +18,43 @@
   high-water marks, origin age, unique senders/subjects, and a 50-entry
   recent-message ring buffer. Inspect with `/frp stats [section|last n|reset]`
   or `ns.Stats.snapshot()`.
+- `/frp mem` memory diagnostics: forced-GC live memory reading, `churn [n]`
+  allocation-rate sampling, and `census` live counts of the internal tables.
+- `Util.newPool` shared table-pool primitive (acquire/release/size).
+- `/frp relays` inspects relay selection: learned relays/contacts, online
+  roster candidates, and the last fanout's chosen targets per leg. The
+  `fanout` debug category now prints the picked names, not just counts.
+- Roster rebuilds are gated on `C_Club.ClubsHaveBeenLoaded`, and a build
+  that collected GUIDs but saw no faction values (member info still
+  streaming) is discarded and retried after `C.ROSTER_RETRY` seconds
+  instead of publishing an empty-faction roster for a whole memo window.
 
 ### Changed
+
+- Allocation-churn reduction across the hot paths (measured via `/frp mem
+  churn`; the 40 MB sawtooth was garbage backlog, not leaks):
+  - The send queue now holds pooled descriptor records instead of a closure
+    per chunk, ring-indexed (no `table.remove` shifts); per-leg completion is
+    flat fields on the last descriptor rather than a `legDone` closure.
+  - Inbound transport contexts are persistent scratch tables (reused per
+    event, never retained past the synchronous handler).
+  - `ChunkReassembler` buffers key two-level by sender→msgId (no per-chunk
+    key concat), parse headers positionally, pool buffer/piece tables, and
+    return metadata as multiple return values instead of a meta table.
+  - `parseMessage`/`buildMessage`/`chunk` avoid split/join tables and
+    `string.format`.
+  - Fanout: the five per-call closures are hoisted to methods/file-locals;
+    leg candidate lists, seen-maps and sent-key sets are wiped shared
+    scratch; `commUsage` entries reset in place on window expiry; the
+    Battle.net account list is memoized (`C.BNET_MEMO` = 15s) instead of a
+    per-fanout friends-list scan.
+  - The club roster rebuild writes into a persistent back buffer and swaps
+    atomically, so the 45s rebuild no longer re-allocates O(roster) tables;
+    the per-slice timer closure is hoisted.
+  - `receivedPending` records are pooled; `injectOrder` is ring-indexed;
+    `guidMemo` entries reset in place; TRP3 injection unrolls its section
+    map; the stats recent ring reuses entry slots.
+  - Disabled debug/stats paths remain a single nil-guarded lookup.
 
 - Debug log hooks and stats recorders are installed/removed with their flags
   instead of checking flags per call, so disabled debug facilities cost a
