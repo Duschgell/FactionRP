@@ -157,6 +157,22 @@ function TRP3Adapter:extract(unitID)
 	}
 end
 
+--- Cheap "could we serve this unit's profile" check for the pull exchange:
+-- true when TRP3 holds a profile for the unit (or it is us). Does not
+-- extract — the expensive copy only runs once a request is granted.
+function TRP3Adapter:canServe(unitID)
+	if not unitID or not self:isAvailable() then
+		return false
+	end
+	if unitID == TRP3_API.globals.player_id then
+		return TRP3_API.profile.getPlayerCurrentProfileID() ~= nil
+	end
+	local reg = TRP3_API.register
+	return reg.isUnitIDKnown(unitID)
+		and reg.hasProfile(unitID)
+		and reg.getUnitIDProfileID(unitID) ~= nil
+end
+
 --- Inject a received profile into TRP3's register so TRP3 renders it.
 -- Mirrors the sequence TRP3 itself uses when receiving a profile.
 -- @return boolean Whether anything was injected.

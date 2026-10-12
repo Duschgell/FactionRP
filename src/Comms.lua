@@ -20,11 +20,19 @@ function Comms:init()
 	-- The paced outbound queue holds *descriptors* (pooled records), not
 	-- closures: a send at steady state allocates nothing.
 	self.queue = { head = 1, tail = 0 }
+	self.sendCredit = 0 -- token bucket: chunks release at C.SEND_RATE/sec
 	self.descAcquire, self.descRelease = ns.Util.newPool(C.POOL_SEND_DESC)
 	self.messageHandler = nil -- set by Broadcast: fn(rawMessage, context)
 	self.started = false
 	-- Memoized online WoW BNet account ids (see bnetAccounts).
 	self.bnetAcctMemo = { ids = {}, at = 0 }
+	-- FRP1 BNet peer confirmation state, session-only, reset in place:
+	--   [gameAccountID] = { confirmedAt, lastProbe, probes, ignoredAt, lastHi, version }
+	self.bnetPeers = {}
+	self.probeCursor = 0
+	-- [senderKey] = GetTime() expiry — chunks from senders whose messages
+	-- failed the version/malformed gates are dropped before reassembly.
+	self.rejectedSenders = {}
 	-- Scratch transport contexts, mutated per inbound event. Passed to the
 	-- message handler — valid only for the duration of that synchronous call
 	-- (scratch: do not retain).
@@ -59,6 +67,29 @@ function Comms:start()
 	end)
 	self:joinChannel()
 
+	-- Friend presence churn: every event refreshes the online-account memo,
+	-- but only an actual account coming online re-opens probing — INFO_CHANGED
+	-- and FRIENDLIST_UPDATE fire on zone/status churn constantly and would
+	-- otherwise keep resurrecting ignored accounts before their TTL.
+	local function onFriendPresence()
+		self.bnetAcctMemo.at = 0
+	end
+	local function onFriendOnline()
+		self.bnetAcctMemo.at = 0
+		for _, p in pairs(self.bnetPeers) do
+			p.ignoredAt = 0
+		end
+	end
+	ns.RegisterEvent("BN_FRIEND_ACCOUNT_ONLINE", onFriendOnline)
+	ns.RegisterEvent("BN_FRIEND_INFO_CHANGED", onFriendPresence)
+	ns.RegisterEvent("FRIENDLIST_UPDATE", onFriendPresence)
+	ns.RegisterEvent("BN_DISCONNECTED", function()
+		for id in pairs(self.bnetPeers) do
+			self.bnetPeers[id] = nil
+		end
+		self.bnetAcctMemo.at = 0
+	end)
+
 	-- Paced sender and stale-buffer pruning.
 	self.sendTicker = C_Timer.NewTicker(C.SEND_INTERVAL, function()
 		self:flushQueue()
@@ -79,6 +110,34 @@ end
 
 -- Channel -------------------------------------------------------------------
 
+--- Leave any FactionRP channel that is not our protocol generation: the
+-- legacy "FactionRP" channel and "frp<N>comms" with a different N. Channel
+-- membership survives /reload (it lives in the chat layer until logout), so
+-- without this sweep an upgraded client keeps receiving old-protocol traffic
+-- for the rest of the session.
+function Comms:leaveForeignChannels()
+	local current = C.COMM_CHANNEL:lower()
+	-- Direct check for the legacy channel: cheap and independent of whether
+	-- hidden channels enumerate in GetChannelList.
+	local legacyId = GetChannelName("FactionRP")
+	if legacyId and legacyId ~= 0 then
+		LeaveChannelByName("FactionRP")
+	end
+	local n = GetNumDisplayChannels()
+	for i = 1, n do
+		local _, name = GetChannelList(i)
+		if type(name) == "string" then
+			local lower = name:lower()
+			local gen = lower:match("^frp(%d+)comms$")
+			if (lower == "factionrp" or (gen and tonumber(gen) ~= C.PROTO_MAJOR))
+				and lower ~= current
+			then
+				LeaveChannelByName(name)
+			end
+		end
+	end
+end
+
 --- Join the hidden same-faction relay channel (no chat tab).
 -- Joining is idempotent (client no-ops when already joined), but every join
 -- still fires CHANNEL_UI_UPDATE/CHANNEL_COUNT_UPDATE toggles in the client.
@@ -86,6 +145,7 @@ end
 -- manager, which repeatedly re-evaluates its own channel index while the list
 -- churns) see extra work and can transiently resolve the wrong index.
 function Comms:joinChannel()
+	self:leaveForeignChannels()
 	if self:channelIndex() then
 		return -- already in the channel; nothing to do
 	end
@@ -162,19 +222,24 @@ function Comms:sendDescriptor(desc)
 	end
 end
 
---- Release up to SEND_BURST queued sends. Invoked on a timer.
+--- Release queued sends at C.SEND_RATE chunks/second. A fractional token
+--- bucket keeps fractional rates smooth (7.5/s releases 1,2,1,2,... per
+--- 0.2s tick); credit is capped at SEND_RATE so an idle queue cannot bank
+--- an unbounded burst. Invoked on a timer.
 function Comms:flushQueue()
 	local q = self.queue
 	local head = q.head
-	local budget = C.SEND_BURST
-	while budget > 0 and head <= q.tail do
+	self.sendCredit = math.min(self.sendCredit + C.SEND_RATE * C.SEND_INTERVAL, C.SEND_RATE)
+	local sent = 0
+	while (self.sendCredit - sent) >= 1 and head <= q.tail do
 		local desc = q[head]
 		q[head] = nil
 		head = head + 1
 		self:sendDescriptor(desc)
 		self.descRelease(desc)
-		budget = budget - 1
+		sent = sent + 1
 	end
+	self.sendCredit = self.sendCredit - sent
 	q.head = head
 	if head > q.tail then
 		-- Queue drained: reset indices so the array part stays small.
@@ -216,8 +281,22 @@ end
 -- The final chunk's descriptor carries leg-completion fields so the stats
 -- collector can time how long a full message took to drain to this leg.
 
+--- Whether a leg of `n` chunks fits within the queue bound. Legs drop whole:
+-- a partial message is an incomplete at the far end plus wasted sibling sends.
+local function legFits(comms, n)
+	return comms:queueDepth() + n <= C.SEND_QUEUE_CAP
+end
+
+-- @return number|false Chunk count queued, or false when the whole leg was
+--   dropped for capacity. Callers must not mark work as sent on false.
 function Comms:sendChunksAddon(chunks, kind, target)
 	local n = #chunks
+	if not legFits(self, n) then
+		if ns.statsError then
+			ns.statsError("send_queue_drop")
+		end
+		return false
+	end
 	local bytes, startedAt = 0, GetTime()
 	for i = 1, n do
 		bytes = bytes + #chunks[i]
@@ -230,10 +309,17 @@ function Comms:sendChunksAddon(chunks, kind, target)
 			desc.legTotal = n
 		end
 	end
+	return n
 end
 
 function Comms:sendChunksBNet(chunks, gameAccountID)
 	local n = #chunks
+	if not legFits(self, n) then
+		if ns.statsError then
+			ns.statsError("send_queue_drop")
+		end
+		return false
+	end
 	local bytes, startedAt = 0, GetTime()
 	for i = 1, n do
 		bytes = bytes + #chunks[i]
@@ -246,6 +332,7 @@ function Comms:sendChunksBNet(chunks, gameAccountID)
 			desc.legTotal = n
 		end
 	end
+	return n
 end
 
 -- Peer enumeration ----------------------------------------------------------
@@ -306,18 +393,128 @@ function Comms:bnetAccounts()
 	return memo.ids
 end
 
---- Invoke callback(characterName) for every online (same-faction) WoW friend.
-function Comms:eachOnlineFriend(callback)
-	if not C_FriendList then
+-- BNet peer confirmation (FRP1 handshake) -----------------------------------
+-- Lifecycle per account: unconfirmed -> probing -> ignored | confirmed.
+-- Any complete, parseable FactionRP message arriving over BNet confirms the
+-- account (bnetPeerSeen).
+-- Entries are reset in place; the map is bounded by the friends list.
+
+local function peerEntry(peers, id)
+	local p = peers[id]
+	if not p then
+		p = { confirmedAt = 0, lastProbe = 0, probes = 0, ignoredAt = 0, lastHi = 0, version = nil }
+		peers[id] = p
+	end
+	return p
+end
+
+--- Stamp `id` as confirmed: it demonstrably runs FactionRP (it sent us a
+-- parseable FRP message). Clears probe/ignore state and records the remote
+-- addon version when supplied (control messages carry it).
+function Comms:bnetPeerSeen(id, version)
+	if not id then
 		return
 	end
-	local num = C_FriendList.GetNumFriends() or 0
-	for i = 1, num do
-		local info = C_FriendList.GetFriendInfoByIndex(i)
-		if info and info.connected and info.name then
-			callback(info.name)
+	local p = peerEntry(self.bnetPeers, id)
+	local was = p.confirmedAt
+	p.confirmedAt = GetTime()
+	p.probes = 0
+	p.ignoredAt = 0
+	if version and version ~= "" then
+		p.version = version
+	end
+	if was == 0 and ns.debugPeer then
+		ns.debugPeer("bnet " .. id .. " confirmed" .. (p.version and (" v" .. p.version) or ""))
+	end
+end
+
+--- Whether `id` holds a live confirmation (proof seen within the TTL).
+function Comms:isBNetConfirmed(id, now)
+	local p = self.bnetPeers[id]
+	return p ~= nil and (now - p.confirmedAt) < C.BNET_CONFIRM_TTL
+end
+
+--- Pick the next online account due for a HELLO probe (round-robin over the
+-- memoized account list). Skips confirmed and ignored accounts; expired
+-- ignores re-enter rotation. Does not stamp — the caller marks the probe
+-- only if it actually queued.
+-- @return number|nil gameAccountID
+function Comms:probeTarget(now)
+	local ids = self:bnetAccounts()
+	local n = #ids
+	if n == 0 then
+		return nil
+	end
+	self.probeCursor = self.probeCursor + 1
+	local offset = ((self.probeCursor - 1) % n) + 1
+	for i = 0, n - 1 do
+		local id = ids[((offset + i - 1) % n) + 1]
+		local p = self.bnetPeers[id]
+		if p
+			and p.ignoredAt ~= 0
+			and (now - p.ignoredAt) >= C.BNET_IGNORE_TTL
+		then
+			-- Ignore decayed: let the account re-enter probe rotation.
+			p.ignoredAt = 0
+			p.probes = 0
+		end
+		local ignored = p and p.ignoredAt ~= 0
+		if not ignored
+			and not self:isBNetConfirmed(id, now)
+			and (not p or (now - p.lastProbe) >= C.BNET_PROBE_COOLDOWN)
+		then
+			return id
 		end
 	end
+	return nil
+end
+
+--- Record that a HELLO probe was actually queued to `id`. Past
+-- BNET_PROBE_MAX unanswered probes the account is ignored until
+-- BNET_IGNORE_TTL (or a friend-presence event) re-opens it.
+function Comms:markProbed(id, now)
+	local p = peerEntry(self.bnetPeers, id)
+	p.lastProbe = now
+	p.probes = p.probes + 1
+	if p.probes > C.BNET_PROBE_MAX and p.ignoredAt == 0 then
+		p.ignoredAt = now
+		if ns.debugPeer then
+			ns.debugPeer("bnet " .. id .. " ignored (" .. p.probes .. " unanswered probes)")
+		end
+	end
+end
+
+--- Whether we may send another HI handshake reply to `id` (rate-limit so a
+-- HELLO-spamming peer cannot drain our queue).
+function Comms:canHi(id, now)
+	local p = self.bnetPeers[id]
+	return not p or (now - p.lastHi) >= C.BNET_HI_COOLDOWN
+end
+
+function Comms:markHi(id, now)
+	peerEntry(self.bnetPeers, id).lastHi = now
+end
+
+--- Peer buckets for inspection (/frp relays). Command-time tables.
+function Comms:bnetPeerLists()
+	local now = GetTime()
+	local lists = { confirmed = {}, probing = {}, ignored = {} }
+	for id, p in pairs(self.bnetPeers) do
+		if p.ignoredAt ~= 0 and (now - p.ignoredAt) < C.BNET_IGNORE_TTL then
+			lists.ignored[#lists.ignored + 1] = id
+		elseif (now - p.confirmedAt) < C.BNET_CONFIRM_TTL then
+			lists.confirmed[#lists.confirmed + 1] = id
+		elseif p.lastProbe ~= 0 then
+			lists.probing[#lists.probing + 1] = id
+		end
+	end
+	return lists
+end
+
+--- confirmed, probing, ignored counts (census).
+function Comms:bnetPeerCounts()
+	local lists = self:bnetPeerLists()
+	return #lists.confirmed, #lists.probing, #lists.ignored
 end
 
 -- Inbound -------------------------------------------------------------------
@@ -356,13 +553,35 @@ end
 --- Reassemble a chunk and, once a full message is available, hand it to the
 -- registered message handler with transport context (used by Broadcast for
 -- loop avoidance and to avoid echoing back to the source peer).
--- NOTE: `context` is a shared scratch table — valid only for the duration of
--- this synchronous call chain (incl. messageHandler). Never retain it.
+-- NOTE: `context` is a shared scratch table which is valid only for the duration of
+-- this synchronous call chain (incl. messageHandler).
+--- Mark a sender as rejected: their chunks are dropped before reassembly for
+-- REJECTED_SENDER_TTL seconds. Called by the message layer when a complete
+-- message fails the protocol-version or malformed gates — the version lives
+-- inside the envelope, so chunk-level filtering is impossible without this
+-- marker. Wire accounting (statsChunkIn) still counts their traffic.
+function Comms:blockSender(senderKey)
+	if self.rejectedSenders[senderKey] then
+		return
+	end
+	self.rejectedSenders[senderKey] = GetTime() + C.REJECTED_SENDER_TTL
+	if ns.debugPeer then
+		ns.debugPeer("blocked " .. tostring(senderKey) .. " (rejected protocol)")
+	end
+end
+
 function Comms:handleIncoming(chunkString, context)
 	-- Reassembly is keyed by a stable per-sender identity.
 	local senderKey = context.senderKey
 	if ns.statsChunkIn then
 		ns.statsChunkIn(context.medium, #chunkString)
+	end
+	local blockedUntil = senderKey and self.rejectedSenders[senderKey]
+	if blockedUntil then
+		if GetTime() < blockedUntil then
+			return -- old-protocol/garbage stream: never reassembled
+		end
+		self.rejectedSenders[senderKey] = nil -- block decayed
 	end
 	if ns.debugChunk then
 		ns.debugChunk("in", context.medium, senderKey, #chunkString)

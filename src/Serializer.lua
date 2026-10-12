@@ -69,11 +69,15 @@ end
 
 -- Envelope codec ------------------------------------------------------------
 --
--- Wire layout (see README "Message Structure"):
---   SENDER || SUBJECT || NAME-REALM || ADDON || ORIGIN-TIME || CONTENT-VERSION || DATA
--- DATA is always last so any "||" inside the encoded payload is preserved.
+-- Wire layout (see doc/protocol.md):
+--   SENDER || SUBJECT || NAME-REALM || ADDON || ORIGIN-TIME || CONTENT-VERSION
+--        || PROTO-MAJOR || DATA
+-- PROTO-MAJOR is stamped automatically and gates interop: receivers reject
+-- any envelope advertising a lower protocol generation (see Broadcast), so
+-- older-protocol clients — including modified ones on our prefix — cannot be
+-- served or confirmed. DATA is always last so any "||" inside the encoded
+-- payload is preserved.
 
-local MESSAGE_FIELDS = 7
 local SEP_LEN = #C.SEPARATOR
 
 --- Build the envelope string from a message table.
@@ -84,11 +88,11 @@ function Serializer.buildMessage(msg)
 	local sep = C.SEPARATOR
 	return msg.sender .. sep .. msg.subject .. sep .. msg.unitID .. sep
 		.. msg.addon .. sep .. tostring(msg.originTime) .. sep
-		.. msg.contentVersion .. sep .. msg.data
+		.. msg.contentVersion .. sep .. C.PROTO_MAJOR .. sep .. msg.data
 end
 
 --- Parse an envelope string back into a message table. Returns nil if the
--- field count is wrong. Parsed positionally (six separator finds, no split
+-- field count is wrong. Parsed positionally (seven separator finds, no split
 -- table) to keep the inbound path allocation-light.
 -- @param str string
 -- @return table|nil
@@ -106,6 +110,8 @@ function Serializer.parseMessage(str)
 	if not s5 then return nil end
 	local s6 = str:find(sep, s5 + SEP_LEN, true)
 	if not s6 then return nil end
+	local s7 = str:find(sep, s6 + SEP_LEN, true)
+	if not s7 then return nil end
 	return {
 		sender = str:sub(1, s1 - 1),
 		subject = str:sub(s1 + SEP_LEN, s2 - 1),
@@ -113,7 +119,8 @@ function Serializer.parseMessage(str)
 		addon = str:sub(s3 + SEP_LEN, s4 - 1),
 		originTime = tonumber(str:sub(s4 + SEP_LEN, s5 - 1)),
 		contentVersion = str:sub(s5 + SEP_LEN, s6 - 1),
-		data = str:sub(s6 + SEP_LEN),
+		protoVer = tonumber(str:sub(s6 + SEP_LEN, s7 - 1)),
+		data = str:sub(s7 + SEP_LEN),
 	}
 end
 

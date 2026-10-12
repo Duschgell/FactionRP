@@ -68,7 +68,7 @@ local function resetStore()
 	-- Per-medium counters keyed by channel kind ("CHANNEL", "BNET", ...).
 	stats.mediumsIn = {}  -- [medium] = { msgs, bytes, chunks }
 	stats.mediumsOut = {}
-	stats.legs = {}       -- [leg] = sends ("channel","group","bnet","community","guild","pinned","friends")
+	stats.legs = {}       -- [leg] = sends ("channel","group","bnet","community","guild","pinned","req","ack","ok","nok","hi","serve","bnet_probe")
 
 	stats.cache = { new = 0, updated = 0, refreshed = 0, rejected = 0 }
 	stats.errors = {} -- [kind] = count
@@ -277,7 +277,7 @@ local function recOutLeg(medium, target, bytes, chunks, elapsed)
 	pushRecent("out", medium, target, bytes, chunks, elapsed * 1000)
 end
 
---- A logical outbound message was built (originate or relay).
+--- A logical outbound message was built (serve or request).
 local function recOutMessage(bytes, chunks, subject, how)
 	stats.outMsgs = stats.outMsgs + 1
 	stats.outBytes = stats.outBytes + bytes
@@ -595,15 +595,19 @@ local function printCensus()
 		end
 		ns.Print(("  send queue %d | reassembly %d bufs / %d senders | bnet memo %d ids"):format(
 			comms:queueDepth(), bufs, senders, #comms.bnetAcctMemo.ids))
+		local conf, probing, ignored = comms:bnetPeerCounts()
+		ns.Print(("  bnet peers %d conf / %d probing / %d ignored | blocked senders %d"):format(
+			conf, probing, ignored, mapSize(comms.rejectedSenders)))
 	end
 	if ns.cache then
 		ns.Print(("  cache entries %d"):format(ns.cache:count()))
 	end
 	local b = ns.broadcast
 	if b then
-		ns.Print(("  inject %d | relays %d | contacts %d | commUsage %d | pinned %d"):format(
+		ns.Print(("  inject %d | relays %d | contacts %d | commUsage %d | pinned %d | reqs %d | serves %d"):format(
 			b:injectDepth(), mapSize(b.knownRelays), mapSize(b.xfacContacts),
-			mapSize(b.commUsage), mapSize(b.forcedTargets)))
+			mapSize(b.commUsage), mapSize(b.forcedTargets),
+			mapSize(b.requests), mapSize(b.pendingServes)))
 	end
 	local sc = ns.scanner
 	if sc then

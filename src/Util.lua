@@ -199,6 +199,7 @@ local function rosterTables()
 		xfacGuild = {},     -- online opposite-faction guild members (names)
 		factionByName = {}, -- normalized name -> PvPFaction (may be nil)
 		guidByName = {},    -- normalized name -> GUID
+		nameByGuid = {},    -- GUID -> display "Name-Realm" (request serving)
 		guildByName = {},   -- normalized name -> true (guild members)
 		communityByName = {} -- normalized name -> true (community members)
 	}
@@ -282,6 +283,7 @@ local function stepRosterBuild(build)
 					end
 					if info.guid and canaccessvalue(info.guid) then
 						t.guidByName[key] = info.guid
+						t.nameByGuid[info.guid] = fullUnitName(info.name)
 						if info.faction ~= nil
 							and info.faction ~= selfFaction()
 							and PRESENCE_ONLINE[info.presence]
@@ -354,6 +356,7 @@ local function startRosterBuild()
 	wipe(back.xfacGuild)
 	wipe(back.factionByName)
 	wipe(back.guidByName)
+	wipe(back.nameByGuid)
 	wipe(back.guildByName)
 	wipe(back.communityByName)
 	wipe(buildSeenXfac)
@@ -406,6 +409,12 @@ end
 function Util.isCommunityClubMember(unitID)
 	local key = normalizeUnitName(unitID)
 	return key ~= nil and clubRoster().communityByName[key] == true
+end
+
+--- Reverse lookup: the display "Name-Realm" of a club member by GUID, or nil.
+-- Used to resolve request subjects to extractable unit IDs.
+function Util.unitForGuid(guid)
+	return guid and clubRoster().nameByGuid[guid] or nil
 end
 
 local function guidFromUnits(unitID)

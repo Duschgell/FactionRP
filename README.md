@@ -29,27 +29,26 @@ flowchart LR
 
 ### Select Player
 
-When a player is "selected", their profile is extracted and stored in the internal
-database of the AddOn. A player is considered "selected" when the mouse hovers over someone,
-or someone is selected as target.
+When a player is "selected" (mouseover or target), two things can happen:
 
-A player is also "selected" indirectly: whenever the RP AddOn itself receives profile
-data over its own comm channels -- like TRP3's exchange protocol, or MSP for non-TRP3 AddOn --
-that profile is treated like a selection and re-broadcast through the network. Because
-receipts arrive per profile section, they are coalesced with a short debounce plus a
-random jitter (so many clients receiving the same profile don't all flood at once —
-the first copy to arrive suppresses the rest), and re-broadcasts drain at a bounded
-rate through a capped queue, so busy environments cannot overwhelm the comm throttle.
+* **Same-faction / ourselves**: the profile is extracted and *published to the
+  local cache* — no wire traffic — so that we can serve it when a peer asks.
+* **Opposite-faction**: this is the pull trigger. If the subject's profile is
+  not fresh in our cache, we send a `REQ` for their GUID to the mesh (see
+  "The pull exchange").
 
-Feedback from our own traffic is deliberately ignored: profiles we push into the RP
-AddOn's register (directory injection and tooltip enrichment) fire the same
-"profile updated" signals as real data. Re-originating on those would form a loop
-(one received profile ⇒ inject ⇒ update event ⇒ re-broadcast ⇒ peers inject again),
-which was the root cause of duplicated TRP3 map-scan results (issue #1). The
-Scanner therefore only re-originates for units the user actually selected this
-session (mouseover/target, or ourselves), and skips a share whose content version
-is unchanged since our last originate (`lastSharedVersion` bookkeeping in
-`Scanner.lua`).
+A player is also "selected" indirectly: whenever the RP AddOn itself receives
+profile data over its own comm channels — like TRP3's exchange protocol, or MSP
+for non-TRP3 AddOn — that profile is extracted and cached the same way (still
+no wire traffic), with a debounce+jitter collapsing per-section receipt bursts
+and a bounded queue draining at most one extraction per interval.
+
+Feedback from our own traffic is deliberately ignored: profiles we push into the
+RP AddOn's register (directory injection and tooltip enrichment) fire the same
+"profile updated" signals as real data. Re-extracting on those would churn the
+cache for nothing, so the Scanner only re-publishes for units the user actually
+selected this session (mouseover/target, or ourselves), and skips a publish
+whose content version is unchanged since the last one (`lastSharedVersion`).
 
 ### Extract Profile
 
@@ -57,24 +56,27 @@ A player's profile will be extracted from the supported AddOns. (Initially TRP3)
 Since every player has a unique GUID in the game, we use that GUID to store the profile.
 We can also use the same GUID to look up a profile, allowing the AddOn to display the profile when data is available.
 
-### Broadcast Data
+### The pull exchange
 
-We broadcast a profile only when storing it produces NEW or UPDATED content —
-a REFRESHED store (same `CONTENT-VERSION`) extends the TTL but never re-floods.
-Each broadcast fans out over every available leg:
+Profile data never floods. It travels exactly once — server to requester —
+after a granted request, using single-chunk FRP1 control messages
+(`subject = "_frp"`, `data = "FRP1 <verb> <arg>"`; see `doc/protocol.md`):
 
-* The hidden same-faction comm channel
-* Battle.NET game-account messages to online WoW friends (cross-faction relays)
-* Group/raid/instance addon messaging, when grouped
-* Addon whispers to a capped set of opposite-faction members of our own
-  communities and guild (see "Community relays")
-* Optionally, regular (non-Battle.NET) online friends — disabled by default
-  (`RELAY_TO_FRIENDS`), redundant with the channel
+1. **REQ \<guid\>** — fanned out to: the same-faction channel, the group,
+   *confirmed* Battle.net peers, and a capped rotating set of opposite-faction
+   club members by addon whisper (see "Community relays").
+2. **ACK \<guid\>** — each recipient that can actually extract the profile
+   (it is themselves, resolvable via cache/club roster, and present in their
+   RP AddOn's register) replies to the requester. Misses stay silent.
+3. **OK \<guid\>** — the requester grants the *first* ACK; every later ACK
+   gets **NOK \<guid\>** and stands down.
+4. The winner extracts and sends the normal data envelope directly to the
+   requester (whisper or Battle.net). The requester caches and injects it —
+   and never relays it further.
 
-The receivers store the data in their own cache and propagate the information
-further through the same legs. They do not send the message back toward the
-peer they received it from, and ignore traffic from their own GUID (loop
-avoidance).
+Requests deduplicate per subject (pending + a 60s cooldown), expire at 15s
+without ACK / 30s without data, and are bounded (`REQ_MAX_PENDING`). Granted
+serves expire after 30s without an `OK`.
 
 ### Message Structure
 
@@ -84,7 +86,7 @@ We use `||` as separator, as this does not conflict with most AddOns.
 
 **structure**:
 ```
-SENDER-PLAYER-GUID||SUBJECT-PLAYER-GUID||SUBJECT-NAME-REALM||SOURCE-ADDON||ORIGIN-TIME||CONTENT-VERSION||PROFILE-DATA
+SENDER-PLAYER-GUID||SUBJECT-PLAYER-GUID||SUBJECT-NAME-REALM||SOURCE-ADDON||ORIGIN-TIME||CONTENT-VERSION||PROTO-VERSION||PROFILE-DATA
 ```
 
 * `SUBJECT-NAME-REALM` is required because a GUID alone cannot be resolved to a character
@@ -101,29 +103,43 @@ SENDER-PLAYER-GUID||SUBJECT-PLAYER-GUID||SUBJECT-NAME-REALM||SOURCE-ADDON||ORIGI
   ordered, content-version is only ever compared for *equality* (to detect "same vs changed");
   `ORIGIN-TIME` provides the actual ordering. Together they de-duplicate gossip (see Broadcast
   Flow) and prevent stale and fresh copies from flapping between mutual peers.
+* `PROTO-VERSION` is the wire-protocol generation (`C.PROTO_MAJOR`). Receivers reject
+  any envelope advertising a lower generation *before* touching peer state, and the
+  comm channel carries the generation in its name (`frp3comms`) — older-protocol
+  clients, including modified ones, can neither interop nor confirm themselves.
 
 Because a single in-game AddOn message is capped at 255 bytes, larger profiles are split into
 numbered chunks and re-assembled by the receiver before processing.
 
+### Battle.net peer confirmation
+
+We never assume a Battle.net friend runs FactionRP. The `HELLO`/`HI`
+handshake confirms peers session-locally:
+
+* Every `BNET_PROBE_INTERVAL` (10s) we probe the next online, unconfirmed,
+  non-ignored friend with a `HELLO`; the reply is `HI`.
+* Any complete, parseable FactionRP message from an account — handshake or
+  otherwise — confirms it for `BNET_CONFIRM_TTL` (10 min).
+* `BNET_PROBE_MAX` (3) unanswered probes ignore the account for
+  `BNET_IGNORE_TTL` (30 min); friend-presence events re-open probing early.
+* Data and `REQ` legs on Battle.net go to confirmed accounts only.
+
+Whisper relays need no handshake: `REQ` messages to unconfirmed
+cross-faction club members double as discovery — a reply proves the AddOn.
+
 ### Broadcast Flow
-This section illustrates what happens when a message needs to be broadcast:
+There is no data broadcast: only single-chunk control messages fan out, and
+profile data moves once per exchange. A `REQ` goes to:
 
-* When not in a party/raid: 
-  * Broadcast the data through the AddOn Comm Channel to share with same faction users
-  * Broadcast the data through Battle.NET friends
-  * Whisper the data to a capped set of opposite-faction members of our own
-    communities and of our own guild (see "Community relays")
-  * (Disabled by default) Broadcast the data through regular friends
-* when in a part/raid:
-  * Same as alone + broadcast through party/raid AddON messaging.
+* The hidden same-faction comm channel (joined via `JoinTemporaryChannel`)
+* Party/raid/instance addon messaging, when grouped
+* *Confirmed* Battle.net friends (see "Battle.net peer confirmation")
+* A capped set of opposite-faction community/guild members by whisper
+  (see "Community relays")
 
-The "AddOn Comm Channel" is a hidden chat channel (joined via `JoinTemporaryChannel`) over which
-same-faction clients exchange addon messages. Cross-faction sharing is possible over
-Battle.NET connections and via addon whispers to opposite-faction community and
-guild members (see below).
-
-All chunk sends go through a paced internal queue (`SEND_BURST` messages per
-`SEND_INTERVAL`), and each primitive is additionally routed through **Chomp** —
+All chunk sends go through a paced internal queue — `C.SEND_RATE` chunks per
+second is the single outbound rate dial, released via a token bucket on the
+`SEND_INTERVAL` tick — and each primitive is additionally routed through **Chomp** —
 the ChatThrottleLib wrapper TRP3 already ships — on the `LOW` priority queue,
 falling back to the raw `C_ChatInfo.SendAddonMessage` / `BNSendGameData` calls
 when Chomp is unavailable. This coalesces our bulk gossip traffic into the same
@@ -136,15 +152,14 @@ join fires channel-list churn that other addons' channel bookkeeping reacts to.
 ### Community relays
 
 WoW communities cannot carry addon messages directly, but cross-faction *whispers* —
-including addon whispers — work between members of a shared community. Every broadcast
+including addon whispers — work between members of a shared community. Every `REQ`
 therefore also whispers a capped set of opposite-faction members of our own
 subscribed clubs — run as **two independent legs**: communities (`COMM_RELAY_LIMIT`)
 and our own guild (`GUILD_RELAY_LIMIT`; cross-faction guilds make those members
 whisper-reachable too, and the leg is skipped entirely when guildless). Both legs
-select online members only, deduplicated by GUID across clubs. Sends are blind:
-clients without FactionRP silently discard the message, so the only cost is send-queue
-capacity. Whispers are the costliest leg, hence the small cap — a few seeded peers
-flood their own faction side anyway.
+select online members only, deduplicated by GUID across clubs. These legs carry
+single-chunk control messages, so the caps can be generous; members without
+FactionRP simply cannot parse or answer the request.
 
 Candidate order, so the limited slots go to the most promising relays first:
 
@@ -175,9 +190,10 @@ A message should be ignored when any of the following is true:
 * The sender GUID is the same as the user's GUID (loop avoidance).
 * We already hold the subject's profile with the same `CONTENT-VERSION`, or with an `ORIGIN-TIME`
   newer than the incoming message (de-duplication / staleness rejection). We only store and
-  re-broadcast when the content differs *and* the incoming copy is not older.
+  inject when the content differs *and* the incoming copy is not older.
 
-When re-broadcasting, we never send the message back toward the peer we received it from.
+Control messages (`subject = "_frp"`) are handled by the exchange state machines
+and never cached, injected, or relayed.
 
 ### Directory injection
 
@@ -224,7 +240,9 @@ Running the base command with no (or an unrecognised) sub-command prints the usa
 * `/factionrp debug all [on|off]` — Toggle every category at once.
 * `/factionrp relays` — Show learned relay state: confirmed FRP whisper
   relays, proven cross-faction contacts, online roster candidates per leg,
-  and the actual targets chosen by the most recent fanout.
+  Battle.net peers by bucket (confirmed / probing / ignored), the pending
+  request/serve counts, and the actual targets chosen by the most recent
+  control fanout.
 * `/factionrp debug target [Name-Realm]` — Pin a whisper target that bypasses
   the community/guild selection and caps (testing). `clear` resets; no argument
   lists pins. Only sends while the `targets` category (or `all`) is on.
@@ -244,7 +262,6 @@ debugging can be targeted, or everything can be enabled at once with
 
 The categories:
 
-* `broadcast` — a broadcast is sent, including subject GUID
 * `receive` — a message is received, including sender GUID
 * `cache` — a profile is stored or refreshed in the cache
 * `queue` — a received RP-AddOn profile is queued for re-broadcast, or skipped
@@ -252,6 +269,8 @@ The categories:
   names; see also `/frp relays`)
 * `chunks` — every wire chunk sent or received (very noisy)
 * `targets` — allows pinned whisper targets (`/frp debug target`) to send
+* `peers` — Battle.net handshake and pull-exchange events (probes,
+  confirmations, ignores, REQ/ACK/OK/NOK traffic, serves)
 * `stats` — collects traffic statistics (see below)
 
 ### Traffic statistics
@@ -274,6 +293,11 @@ cannot grow memory):
 * Unique senders/subjects seen this session
 * A ring buffer of the last 50 messages for close inspection
   (`/frp stats last [n]`)
+* The send queue is bounded (`SEND_QUEUE_CAP` = 384 chunks): when outbound
+  demand exceeds the paced drain rate, legs that cannot fit are dropped
+  whole — never individual chunks, which would guarantee an incomplete
+  message at the far end. Dropped legs are counted as `send_queue_drop`
+  under `/frp stats errors`.
 
 `/frp stats` prints a summary; the sections drill into each area. The same
 data is available programmatically via `ns.Stats.snapshot()`.

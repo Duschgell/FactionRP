@@ -1,9 +1,10 @@
 -- Scanner.lua
 --
--- Watches for player "selection" (mouseover / target) and originates a
--- broadcast of the selected player's profile. We only originate for units the
--- RP AddOn has *authoritative* data for: the local player and same-faction
--- players. Opposite-faction units are display-only (see Tooltip).
+-- Watches for player "selection" (mouseover / target). Same-faction and own
+-- profiles are extracted and *published to the local cache* (Broadcast:publish
+-- — no wire traffic) so we can serve them when a peer asks. Selecting an
+-- opposite-faction unit is the pull trigger: requestProfile asks the mesh
+-- for that subject.
 --
 -- Because the RP AddOn fetches a freshly-seen same-faction profile
 -- asynchronously, we also listen for the adapter's "profile updated" signal and
@@ -97,7 +98,16 @@ function Scanner:onSelect(unit)
 	end
 	-- Opposite-faction players have no authoritative local data to originate;
 	-- they are enriched for display only (Tooltip module).
+	-- Opposite-faction players have no authoritative local data: this is the
+	-- pull-exchange trigger — ask the mesh for their profile (deduped and
+	-- rate-limited inside requestProfile).
 	if ns.Util.isOppositeFaction(unit) then
+		local adapter = ns.getAvailableAdapter()
+		local unitID = adapter and adapter:getUnitID(unit)
+		local guid = UnitGUID(unit)
+		if guid then
+			ns.broadcast:requestProfile(guid, unitID)
+		end
 		return
 	end
 	local adapter = ns.getAvailableAdapter()
@@ -232,7 +242,7 @@ function Scanner:share(adapter, unitID, guid)
 		return -- nothing new since our last originate (e.g. our own injection)
 	end
 	self.lastSharedVersion[unitID] = profile.contentVersion
-	ns.broadcast:originate(guid, unitID, profile)
+	ns.broadcast:publish(guid, unitID, profile)
 end
 
 -- Singleton.

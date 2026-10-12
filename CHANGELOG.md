@@ -1,5 +1,57 @@
 ﻿# FactionRP Changelog
 
+## 0.3.0
+
+### Changed — pull model (breaking protocol change)
+
+- **Profile data no longer floods.** The push-gossip fanout is replaced by a
+  pull exchange: selecting an opposite-faction player (mouseover/target)
+  sends a single-chunk `REQ <guid>` to the mesh; the first peer that can
+  serve the profile `ACK`s, is granted `OK`, and pushes the data envelope
+  directly to the requester. Later `ACK`s receive `NOK`. Requests dedupe per
+  subject, expire (15s no-ACK / 30s no-data), cool down per subject (60s),
+  and are bounded (`REQ_MAX_PENDING`).
+- Hard protocol partition: every envelope carries `C.PROTO_MAJOR` (currently
+  3) as a dedicated field, and receivers reject lower generations before any
+  peer-state side effect — older or modified clients cannot confirm a relay,
+  serve a request, or feed the cache. The comm channel is now `frp3comms`,
+  so older clients sit on a disjoint channel entirely; on load and each
+  re-join we also actively leave the legacy `FactionRP` channel and any
+  foreign-generation `frp<N>comms` channel, since channel membership
+  survives `/reload`.
+- Data is never relayed: inbound profiles are cached and injected into the
+  RP AddOn's register only. Local extraction (`Scanner`) now *publishes* to
+  the cache without touching the wire, so every client can serve what it
+  has seen.
+- All control traffic is the FRP1 control channel — ordinary envelopes with
+  the reserved subject `_frp` and `data = "FRP1 <verb> <arg>"` — never
+  cached, injected, or relayed, and harmlessly dropped by older clients.
+- Wire format documented in `doc/protocol.md`.
+
+### Added
+
+- Battle.net peer confirmation handshake (`HELLO`/`HI`): BNet data and `REQ`
+  legs go only to accounts that have proven they run the AddOn. Unconfirmed
+  friends receive rotating probes; 3 unanswered probes ignore an account for
+  30 min (cleared early by friend-presence events). Confirmations expire
+  after 10 min without fresh proof.
+- New `peers` debug category logging probes, confirmations, ignores, and
+  REQ/ACK/OK/NOK exchange events. `/frp relays` now shows BNet peer buckets
+  and pending request/serve counts.
+- `TRP3Adapter:canServe` (cheap existence check for the server path) and a
+  roster `guid -> unitID` map for resolving request subjects.
+
+### Changed
+
+- Outbound pacing is a single dial: `C.SEND_RATE` chunks/second (token
+  bucket on the 0.2s tick) replaces `SEND_BURST`; default 7.5 (~50% lower).
+- Community/guild relay limits raised to 10 each — these legs now carry
+  single-chunk control messages, not profile data.
+- `sendChunks*` return false on whole-leg queue drop so callers (probes,
+  grants) only stamp state for sends that actually queued.
+- `RELAY_TO_FRIENDS` and the `broadcast` debug category removed (no data
+  fanout remains); `/frp mem census` reports BNet peer and exchange counts.
+
 ## 0.2.3
 
 ### Added
@@ -28,6 +80,10 @@
   that collected GUIDs but saw no faction values (member info still
   streaming) is discarded and retried after `C.ROSTER_RETRY` seconds
   instead of publishing an empty-faction roster for a whole memo window.
+- The send queue is bounded at `C.SEND_QUEUE_CAP` (384) chunks: a leg that
+  cannot fit entirely is dropped whole (per-leg atomic), counted under
+  `send_queue_drop` in `/frp stats errors`. Prevents unbounded backlog
+  when outbound demand exceeds the ~15/s drain capacity.
 
 ### Changed
 

@@ -6,9 +6,9 @@
 -- The flags live in saved variables as ns.db.debug = { all=bool, <cat>=bool }.
 --
 -- Rather than checking flags inside the logging functions, enabled hooks are
--- *installed* onto ns (ns.debugBroadcast, ns.debugReceive, ...) and disabled
+-- *installed* onto ns (ns.debugReceive, ns.debugPeer, ...) and disabled
 -- ones removed. Call sites in Broadcast/Scanner/Comms are nil-guarded
--- ("if ns.debugBroadcast then"), so a disabled category costs a single table
+-- ("if ns.debugReceive then"), so a disabled category costs a single table
 -- lookup and an enabled one runs with zero flag checks. ns.refreshDebugHooks
 -- re-applies the installation whenever flags change.
 --
@@ -33,10 +33,6 @@ end
 -- Log hook implementations ---------------------------------------------------
 -- Each implementation is stored next to the category that gates it; the
 -- installer below publishes them under their ns.* names while enabled.
-
-local function logBroadcast(subjectGUID)
-	ns.Print("|cffffd200[broadcast]|r sent profile for " .. tostring(subjectGUID))
-end
 
 local function logReceive(senderGUID, subjectGUID)
 	ns.Print(("|cff66ccff[received]|r from %s (subject %s)"):format(tostring(senderGUID), tostring(subjectGUID)))
@@ -78,15 +74,19 @@ local function logChunk(direction, medium, peer, bytes)
 	))
 end
 
+local function logPeer(text)
+	ns.Print("|cff66ccff[peers]|r " .. text)
+end
+
 -- [ns.* hook name] = { category, implementation }
 local HOOKS = {
-	debugBroadcast = { "broadcast", logBroadcast },
 	debugReceive   = { "receive",   logReceive },
 	debugStore     = { "cache",     logStore },
 	debugReceived  = { "queue",     logReceived },
 	debugSkip      = { "queue",     logSkip },
 	debugFanout    = { "fanout",    logFanout },
 	debugChunk     = { "chunks",    logChunk },
+	debugPeer      = { "peers",     logPeer },
 }
 
 --- Install enabled log hooks onto ns and remove disabled ones. Also refreshes
@@ -226,6 +226,11 @@ ns.RegisterCommand("relays", function()
 	ns.Print("xfac contacts (reachable, unconfirmed): " .. joined(mapNames(b.xfacContacts)))
 	ns.Print(("roster candidates: %d community / %d guild"):format(
 		#ns.Util.xfacClubMembers(), #ns.Util.xfacGuildMembers()))
+	local lists = ns.comms and ns.comms:bnetPeerLists() or { confirmed = {}, probing = {}, ignored = {} }
+	ns.Print(("bnet peers — confirmed: %s | probing: %s | ignored: %d"):format(
+		joined(lists.confirmed), joined(lists.probing), #lists.ignored))
+	ns.Print(("exchange — pending requests: %d | pending serves: %d"):format(
+		mapSize(b.requests or {}), mapSize(b.pendingServes or {})))
 	local p = b.lastLegPicks
 	ns.Print(("last fanout — community: %s | guild: %s | bnet: %s | pinned: %s"):format(
 		joined(p.community), joined(p.guild), joined(p.bnet), joined(p.pinned)))

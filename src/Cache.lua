@@ -131,6 +131,11 @@ function Cache:get(guid)
 	return entry
 end
 
+--- Whether a live (non-expired) entry exists for `guid`.
+function Cache:fresh(guid)
+	return self:get(guid) ~= nil
+end
+
 --- Drop every entry regardless of expiry. Testing aid (/frp purge).
 -- @return number Entries dropped.
 function Cache:clear()
