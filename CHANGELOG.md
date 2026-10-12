@@ -1,5 +1,33 @@
 ﻿# FactionRP Changelog
 
+## 0.2.3
+
+### Added
+
+- Fractionalised debug flags: `/frp debug` now lists categories, `/frp debug
+  <category>` toggles one (broadcast, receive, cache, queue, fanout, chunks,
+  targets, stats), and `/frp debug all` toggles everything. Existing
+  `debug = true` settings migrate to `all`.
+- `/frp debug chunks` logs every wire chunk in and out (very noisy).
+- Pinned whisper targets (`/frp debug target`) are now gated on the `targets`
+  category rather than the global debug switch.
+- Session-only traffic statistics while the `stats` category is enabled:
+  message rates (rolling 60s + session), byte sizes (average and median),
+  profile reassembly time (first to last chunk), per-leg transmit time,
+  per-medium and per-leg breakdowns, cache outcome and error tallies, queue
+  high-water marks, origin age, unique senders/subjects, and a 50-entry
+  recent-message ring buffer. Inspect with `/frp stats [section|last n|reset]`
+  or `ns.Stats.snapshot()`.
+
+### Changed
+
+- Debug log hooks and stats recorders are installed/removed with their flags
+  instead of checking flags per call, so disabled debug facilities cost a
+  single nil-guarded table lookup at each call site.
+- `ChunkReassembler:add` now returns reassembly metadata (chunk count,
+  first-to-last-chunk elapsed, duplicate arrivals) alongside the completed
+  message, and `prune` returns the number of dropped buffers.
+
 ## 0.2.2
 
 ### Added
