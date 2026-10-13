@@ -40,10 +40,12 @@ flowchart LR
 When a player is "selected" (mouseover or target), two things can happen:
 
 * **Same-faction / ourselves**: the profile is extracted and *published to the
-  local cache* — no wire traffic — so that we can serve it when a peer asks.
+  local cache* — no wire traffic. Serving reads the RP AddOn's register live
+  (TRP3 owns same-faction freshness itself), so the publish mostly keeps our
+  GUID→unitID map warm for requests that arrive without a unitID.
 * **Opposite-faction**: this is the pull trigger. If the subject's profile is
-  not fresh in our cache, we send a `REQ` for their GUID to the mesh (see
-  "The pull exchange").
+  not fresh in our cache, we send a `REQ` for their GUID — carrying their
+  unitID when we know it — to the mesh (see "The pull exchange").
 
 A player is also "selected" indirectly: whenever the RP AddOn itself receives
 profile data over its own comm channels — like TRP3's exchange protocol, or MSP
@@ -70,12 +72,17 @@ Profile data never floods. It travels exactly once — server to requester —
 after a granted request, using single-chunk FRP1 control messages
 (`subject = "_frp"`, `data = "FRP1 <verb> <arg>"`; see `doc/protocol.md`):
 
-1. **REQ \<guid\>** — fanned out to: the same-faction channel, the group,
-   *confirmed* Battle.net peers, and a capped rotating set of opposite-faction
-   club members by addon whisper (see "Community relays").
-2. **ACK \<guid\>** — each recipient that can actually extract the profile
-   (it is themselves, resolvable via cache/club roster, and present in their
-   RP AddOn's register) replies to the requester. Misses stay silent.
+1. **REQ \<guid\> [unitID]** — fanned out to: the same-faction channel, the
+   group, *confirmed* Battle.net peers, and a capped rotating set of
+   opposite-faction club members by addon whisper (see "Request fanout" and
+   "Community relays"). The unitID is the subject's register key
+   ("Name-Realm"), so any holder can answer straight from its RP AddOn's
+   register.
+2. **ACK \<guid\>** — each recipient whose RP AddOn's register holds the
+   profile replies. The subject's identity is consensus-checked first: every
+   claim held for the guid (local cache, client player-info, club roster,
+   and the wire-asserted unitID) must agree — conflicting or absent claims
+   stay silent. `REQ` for our own GUID answers directly.
 3. **OK \<guid\>** — the requester grants the *first* ACK; every later ACK
    gets **NOK \<guid\>** and stands down.
 4. The winner extracts and sends the normal data envelope directly to the
@@ -84,7 +91,13 @@ after a granted request, using single-chunk FRP1 control messages
 
 Requests deduplicate per subject (pending + a 60s cooldown), expire at 15s
 without ACK / 30s without data, and are bounded (`REQ_MAX_PENDING`). Granted
-serves expire after 30s without an `OK`.
+serves expire after 30s without an `OK`, and our serve rate is
+breaker-limited (`SERVE_RATE_LIMIT` granted serves per `SERVE_RATE_WINDOW`,
+then a `SERVE_RATE_MUTE` bow-out — only winning the ACK race counts, so
+losing ACKs are free): a saturated server simply stops volunteering —
+requesters' timeouts pace their retries, no "busy" wire traffic is spent —
+so other holders win the ACK race. Requests for our *own* profile bypass
+the breaker.
 
 ### Message Structure
 
@@ -141,13 +154,30 @@ cross-faction club members double as discovery — a reply proves the AddOn.
 
 ### Request fanout
 There is no data broadcast: only single-chunk control messages fan out, and
-profile data moves once per exchange. A `REQ` goes to:
+profile data moves once per exchange. A pull's *subject* is always
+opposite-faction, but its *servers* need not be — every faction-mate who
+previously pulled the same subject is a holder. A `REQ` therefore goes to:
 
-* The hidden same-faction comm channel (joined via `JoinTemporaryChannel`)
-* Party/raid/instance addon messaging, when grouped
-* *Confirmed* Battle.net friends (see "Battle.net peer confirmation")
-* A capped set of opposite-faction community/guild members by whisper
-  (see "Community relays")
+* **The hidden same-faction comm channel** — `frp3comms`, an ordinary custom
+  chat channel (like `/1`) joined via `JoinTemporaryChannel`. Custom
+  channels are faction-scoped, so one chunk reaches *every* same-faction
+  FactionRP listener — the biggest pool of candidate servers. Channel sends
+  echo back to the sender and are dropped on receipt.
+* **Party/raid/instance addon messaging**, when grouped
+* ***Confirmed* Battle.net friends** (see "Battle.net peer confirmation") —
+  account-to-account, ignores faction entirely
+* **A capped set of opposite-faction community/guild members by whisper**
+  (see "Community relays"). There is no "community" medium — clubs can't
+  carry addon messages; shared membership is what makes a `WHISPER` send
+  *deliverable* cross-faction, and the roster only enumerates those targets.
+
+Every leg is a single hop: the requester sends each `REQ` itself, and a
+server's `ACK` and profile reply travel directly back to the requester.
+"Relay" means a reachable cross-faction *endpoint* — no client forwards
+messages for anyone else. That also means a requester with **no**
+cross-faction clubs or friends still gets served: the channel and group
+legs always fire, and answering faction-mates whisper back, which needs no
+shared membership.
 
 All chunk sends go through a paced internal queue — `C.SEND_RATE` chunks per
 second is the single outbound rate dial, released via a token bucket on the
@@ -170,17 +200,27 @@ subscribed clubs — run as **two independent legs**: communities (`COMM_RELAY_L
 and our own guild (`GUILD_RELAY_LIMIT`; cross-faction guilds make those members
 whisper-reachable too, and the leg is skipped entirely when guildless). Both legs
 select online members only, deduplicated by GUID across clubs. These legs carry
-single-chunk control messages, so the caps can be generous; members without
-FactionRP simply cannot parse or answer the request.
+single-chunk control messages, and every client maintains its own relay lists —
+coverage is distributed across requesters.
 
-Candidate order, so the limited slots go to the most promising relays first:
+Rather than waiting for requests, we **actively probe** the roster: every
+`RELAY_PROBE_INTERVAL` (2min) a burst of up to `RELAY_PROBE_BURST` (5)
+candidates gets a whispered `HELLO` (never-probed targets first, so everyone
+gets a turn; guild members before community members),
+a whispered `HELLO` earns a `HI` reply, and any parseable inbound whisper
+confirms the sender as a relay for `RELAY_CONFIRM_TTL` (10min). Stale confirmed
+relays are re-probed to keep the list warm, and targets that ignore
+`RELAY_PROBE_MAX` (3) probes are skipped for `RELAY_IGNORE_TTL` (30min).
+Members without FactionRP simply cannot parse or answer.
 
-1. **Confirmed FRP peers** — an opposite-faction club member we have already received
-   an FactionRP whisper from this session provably runs the AddOn.
+Whisper legs now reach only proven targets — the unconfirmed roster is the
+probe rotation's job, so a `REQ` never whispers strangers:
+
+1. **Confirmed FRP peers** — a relay whose confirmation is still fresh.
 2. **Known cross-faction contacts** — opposite-faction club members whose profiles
    reached us via the RP AddOn's own comms (e.g. a TRP3 profile arriving cross-faction
    through the community): proven reachable, almost certainly RP-AddOn users.
-3. **The remaining opposite-faction roster.**
+   (Ignored targets are skipped either way.)
 
 No single member should act as a relay server, so fairness is enforced two ways:
 a **round-robin cursor** spreads picks across the candidate list rather than always

@@ -17,9 +17,29 @@ bytes) and travels over these mediums:
 | `WHISPER`  | `SendAddonMessage` to a player                   | cross-faction club members   |
 | `BNET`     | `BNSendGameData` to a `gameAccountID`            | BNet friends, any faction    |
 
-Cross-faction addon whispers are only possible between members of the same
-community/guild club — that is what makes club rosters the whisper relay
-pool. BNet works between any friends.
+`frp<N>comms` is an ordinary custom chat channel (like `/1`), joined via
+`JoinTemporaryChannel`. Custom channels are faction-scoped — an
+opposite-faction player can never be on it — so its job in the exchange is
+the **same-faction holder pool**: every faction-mate who previously pulled
+a subject is a candidate server, and one channel chunk reaches all of them.
+Channel sends echo back to the sender; those self-echoes are dropped on
+receipt (`sender == our GUID`).
+
+There is no "COMMUNITY" medium — a club cannot carry addon messages at
+all. Cross-faction addon whispers are only possible between members of the
+same community/guild club, so club membership is what makes `WHISPER`
+deliveries *legal* across factions; the roster exists purely to enumerate
+those whisper-reachable targets. BNet works between any friends and ignores
+faction entirely.
+
+**Every leg is a single hop.** The requester sends `REQ` on each medium
+itself; a recipient that can serve replies `ACK` and, if granted, sends the
+profile *directly* to the requester. "Relay" in this document means a
+reachable cross-faction *endpoint* — never a forwarder: no client relays or
+re-sends anything on behalf of another. A requester with no cross-faction
+clubs or friends therefore still gets full use of the channel and group
+legs — answering peers are faction-mates, so their reply whisper needs no
+shared club.
 
 Sends are routed through AddOn_Chomp's `SendAddonMessage`/`BNSendGameData`
 when available (raw ChatThrottleLib passthrough — the prefix and text reach
@@ -107,14 +127,21 @@ Control messages are **never cached, never injected, never relayed** — they
 terminate at the recipient. Clients without FRP1 parse the envelope, fail to
 decode `data` as a profile, and drop it harmlessly.
 
-| Verb    | Arg          | Meaning                                        |
-|---------|--------------|------------------------------------------------|
-| `HELLO` | addonVer     | BNet probe — "I run FactionRP"                 |
-| `HI`    | addonVer     | handshake reply                                |
-| `REQ`   | subjectGuid  | pull request — "who can serve this profile?"   |
-| `ACK`   | subjectGuid  | "I can serve it"                               |
-| `OK`    | subjectGuid  | grant — "you may send it"                      |
-| `NOK`   | subjectGuid  | deny — "stand down"                            |
+| Verb    | Args                | Meaning                                     |
+|---------|---------------------|---------------------------------------------|
+| `HELLO` | addonVer            | BNet probe — "I run FactionRP"              |
+| `HI`    | addonVer            | handshake reply                             |
+| `REQ`   | subjectGuid [unitID]| pull request — "who can serve this profile?"|
+| `ACK`   | subjectGuid         | "I can serve it"                            |
+| `OK`    | subjectGuid         | grant — "you may send it"                   |
+| `NOK`   | subjectGuid         | deny — "stand down"                         |
+
+`REQ` is the only two-argument verb: `unitID` is the subject's
+`"Name-Realm"` as computed by the requester's RP AddOn — the exact key its
+register uses. It is optional (older/adapter-less clients send the guid
+alone) and lets any server answer straight from its register without local
+guid→unitID state. `ACK`/`OK`/`NOK` still carry the guid only — it is the
+wire identity.
 
 ### BNet peer confirmation
 
@@ -144,10 +171,28 @@ any parseable inbound message → confirmed (10 min TTL)
   `BN_DISCONNECTED` wipes the map.
 - **Data and REQ legs on BNet go to confirmed accounts only.**
 
-Whisper peers need no handshake: sending `REQ` to unconfirmed cross-faction
-club members doubles as discovery — any parseable inbound whisper from a club
-member confirms them (`knownRelays`), and non-FRP recipients simply cannot
-answer.
+Whisper peers (cross-faction club members) use the same probe/confirm/ignore
+lifecycle as BNet accounts:
+
+- **Probing**: bursts of up to `RELAY_PROBE_BURST` (5) whispered
+  `HELLO <ver>`s every `RELAY_PROBE_INTERVAL` (120s). Target priority is
+  never-probed candidates first, then the longest-since-probed
+  (`RELAY_PROBE_COOLDOWN`=45s floor), so every candidate gets a turn —
+  guild members are scanned before community members. A whispered `HELLO`
+  is answered `HI` (rate-limited per sender by `RELAY_HI_COOLDOWN`=30s).
+- **Confirming**: any parseable inbound whisper from an opposite-faction
+  club member — `HI`, `ACK`, `REQ`, or data — confirms them for
+  `RELAY_CONFIRM_TTL` (10min). Confirmed relays get fanout priority.
+- **Refreshing**: when no unconfirmed candidates remain, the stalest
+  confirmed relay past half its TTL is re-probed, so quiet-but-alive peers
+  stay confirmed and dead ones decay out of the list.
+- **Ignoring**: `RELAY_PROBE_MAX` (3) unanswered probes ignore a target for
+  `RELAY_IGNORE_TTL` (30min); expired ignores re-enter rotation with a
+  fresh slate. Ignored targets are skipped by `REQ` fanouts too.
+
+`REQ` whisper legs reach only proven targets — confirmed relays and known
+xfac contacts; the unconfirmed roster is the probe rotation's job, so a
+request never whispers strangers.
 
 ## The pull exchange
 
@@ -156,12 +201,14 @@ targets an opposite-faction player whose profile we do not hold fresh.
 
 ```
 requester                                candidate servers
-    │  REQ <guid> ───────────────────────────► (channel + group +
-    │                                          confirmed BNet +
-    │                                          xfac whisper relays)
+    │  REQ <guid> [unitID] ──────────────────► (1 chunk on frp<N>comms —
+    │                                          all same-faction listeners
+    │                                          + group + confirmed BNet
+    │                                          + one whisper per proven
+    │                                          xfac relay)
     │                                          └ can extract? → ACK
     │                                            cannot?  → silent
-    │  ◄── ACK <guid> ── (first wins)
+    │  ◄── ACK <guid> ── (first wins, direct to requester)
     │  ── OK <guid> ──► winner only
     │  ── NOK <guid> ─► every later ACKer
     │  ◄── data envelope ── winner serves direct
@@ -175,16 +222,37 @@ requester                                candidate servers
   `awaiting-data` expires after `REQ_DATA_TIMEOUT` (30s) without data.
 - Data received for a pending subject completes the request from any source;
   if it arrived from a non-winner, the winner is NOK'd best-effort.
+- Misses get no reply — relay confirmation rides the `HELLO`/`HI` probes
+  instead of paying a reply per non-holder.
 
 **Server rules**
-- A `REQ` is ACKed only when we can actually extract the profile: the subject
-  is us, resolvable guid→unitID via the gossip cache or club roster, and the
-  RP AddOn's register holds the profile (`adapter:canServe`).
-- Misses stay silent — a NOK per non-holder costs more than the requester's
-  timeout.
+- A `REQ` is ACKed only when we can actually extract the profile: the
+  subject resolves to a unitID *and* the RP AddOn's register holds the
+  profile (`adapter:canServe` reads the register live — including profiles
+  received in earlier sessions; the register is persisted state, unlike
+  our cache).
+- Subject identity resolves by **consensus**: every claim we hold for the
+  guid — our cache's guid→unitID map, the client player-info cache
+  (`GetPlayerInfoByGUID`), the club roster, and the requester-asserted
+  wire unitID — must agree on one unitID. Any disagreement is a silent
+  miss: we never serve on conflicting identities. A guid-only `REQ`
+  (older peer, or a requester that could not compute the unitID) resolves
+  from local claims alone. `REQ` for our own guid answers directly —
+  we are the authority on ourselves.
+- Misses stay silent — a reply per non-holder costs more than the
+  requester's timeout.
 - An ACK records a *pending serve* (`SERVE_PENDING_CAP`=16, expires at
   `SERVE_TIMEOUT`=30s). `OK` triggers extraction and a direct send;
   `NOK` discards it.
+- Our serve rate is breaker-limited: once `SERVE_RATE_LIMIT` (10) serves
+  are *granted* inside `SERVE_RATE_WINDOW` (30s) we stop answering REQs
+  for `SERVE_RATE_MUTE` (60s). Only winning the ACK race counts — a NOK'd
+  ACK never cost real work, and grants arriving while muted complete
+  their serve without extending it. This is a silent bow-out, not a
+  message — the requester's own timeout and subject-cooldown *are* the
+  backpressure signal, so no wire traffic is spent reporting saturation.
+  REQs for our own GUID bypass the breaker (we are the authoritative
+  server for ourselves).
 - Served data uses a normal data envelope stamped with the server's
   `originTime` (the original authoring time is unknowable server-side).
 

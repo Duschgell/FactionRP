@@ -45,7 +45,7 @@ C.CHUNK_SIZE = 220
 -- idle queue cannot bank an unbounded burst). Dial the whole send rate by
 -- editing this one number.
 C.SEND_INTERVAL = 0.2
-C.SEND_RATE = 7.5
+C.SEND_RATE = 1
 
 -- Cap on the reusable send-descriptor pool (the outbound queue stores pooled
 -- record tables instead of closures). Beyond this depth sends simply allocate
@@ -53,11 +53,11 @@ C.SEND_RATE = 7.5
 C.POOL_SEND_DESC = 256
 
 -- Hard bound on queued send chunks. Outbound demand (inbound rate x chunks
--- x legs) can exceed the 15/s drain capacity during bursts, and an unbounded
--- queue then grows monotonically with every chunk leaving stale. A leg that
+-- x legs) can exceed the drain rate during bursts, and an unbounded queue
+-- then grows monotonically with every chunk leaving stale. A leg that
 -- cannot fit entirely is dropped whole — dropping individual chunks just
 -- produces an incomplete message at the far end while still wasting the
--- siblings' sends. ~384 chunks is ~25s of worst-case dwell at the drain rate.
+-- siblings' sends.
 C.SEND_QUEUE_CAP = 384
 
 -- FRP1 control channel -----------------------------------------------------
@@ -67,7 +67,10 @@ C.SEND_QUEUE_CAP = 384
 -- control-protocol revision for forward compatibility. Verbs:
 --   HELLO <version>  BNet peer probe ("I run FactionRP")
 --   HI <version>     handshake reply
---   REQ <subjectGuid>   pull-exchange request: "who has this profile?"
+--   REQ <subjectGuid> [unitID]   pull-exchange request: "who has this
+--      profile?" The optional unitID (subject's "Name-Realm") lets any
+--      server answer straight from the RP AddOn's register; the guid
+--      remains the wire identity carried back by ACK/OK/NOK.
 --   ACK <subjectGuid>   "I can serve it"
 --   OK  <subjectGuid>   grant: "you may send it"
 --   NOK <subjectGuid>   deny: "stand down" (late ACKs)
@@ -115,6 +118,15 @@ C.REQ_MAX_PENDING = 32   -- bound on outstanding requests
 C.SERVE_PENDING_CAP = 16 -- bound on granted-or-awaiting serves per peer+subject
 C.SERVE_TIMEOUT = 30     -- pending serve expires without an OK
 
+-- Outbound serve breaker: once SERVE_RATE_LIMIT granted serves (ACKs we
+-- were OK'd on) land within SERVE_RATE_WINDOW seconds we stop answering
+-- REQs for SERVE_RATE_MUTE seconds. Only winning the ACK race counts,
+-- volunteering and losing is free. REQs for our own GUID bypass the
+-- breaker: we are the authoritative server for ourselves.
+C.SERVE_RATE_WINDOW = 30
+C.SERVE_RATE_LIMIT = 10
+C.SERVE_RATE_MUTE = 60
+
 -- Caching -------------------------------------------------------------------
 
 -- Time-to-live for a cached profile, in seconds (5 minutes per the design).
@@ -153,13 +165,14 @@ C.GUID_RESOLVE_MEMO = 60
 --
 -- Opposite-faction members of our own WoW communities are reachable by addon
 -- whisper, so profile REQUESTs fan out to a capped rotating set of them.
--- Under the pull model these legs carry single-chunk control messages, not
--- full profile data, so the cap can be generous.
-C.COMM_RELAY_LIMIT = 10
+-- These legs carry single-chunk control messages, and every FRP client
+-- maintains its own relay lists — coverage is distributed across requesters,
+-- so a modest per-request cap suffices.
+C.COMM_RELAY_LIMIT = 5
 
 -- The guild is a second, independent whisper leg (cross-faction guilds exist):
 -- its own capped target list on top of the community one.
-C.GUILD_RELAY_LIMIT = 10
+C.GUILD_RELAY_LIMIT = 5
 
 -- No single member should act as a relay server: each contact may be used at
 -- most COMM_USAGE_LIMIT times per COMM_USAGE_WINDOW seconds. Exhausted
@@ -167,6 +180,22 @@ C.GUILD_RELAY_LIMIT = 10
 -- is never dropped for lack of fresh targets.
 C.COMM_USAGE_LIMIT = 2
 C.COMM_USAGE_WINDOW = 60
+
+-- Whisper relay confirmation (HELLO/HI over addon whispers — same lifecycle
+-- shape as the BNet handshake). Club-roster candidates are probed in bursts
+-- of RELAY_PROBE_BURST every RELAY_PROBE_INTERVAL seconds (a rotating
+-- per-target cooldown still applies); any parseable inbound whisper confirms
+-- the sender for RELAY_CONFIRM_TTL, and stale confirmed relays are re-probed
+-- so quiet-but-alive peers stay confirmed. RELAY_PROBE_MAX unanswered probes
+-- ignore the target for RELAY_IGNORE_TTL (expired ignores re-enter rotation
+-- with a fresh slate).
+C.RELAY_PROBE_INTERVAL = 120 -- gap between whisper probe bursts
+C.RELAY_PROBE_BURST = 5      -- probe targets per burst
+C.RELAY_CONFIRM_TTL = 600    -- relay confirmation expires without fresh proof
+C.RELAY_PROBE_COOLDOWN = 45  -- min gap between probes to the same target
+C.RELAY_PROBE_MAX = 3        -- unanswered probes before ignoring
+C.RELAY_IGNORE_TTL = 1800    -- ignore-list decay
+C.RELAY_HI_COOLDOWN = 30     -- min gap between HI replies to the same target
 
 -- How long (seconds) the scanned club roster (factions, GUIDs and opposite-
 -- faction online members) is memoized. A stale roster is rebuilt

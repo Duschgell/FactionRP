@@ -222,15 +222,62 @@ ns.RegisterCommand("relays", function()
 	if not b then
 		return
 	end
-	ns.Print("known relays (confirmed FRP): " .. joined(mapNames(b.knownRelays)))
+	local now = GetTime()
+	local conf, probing, ignored = {}, {}, 0
+	for _, p in pairs(b.relays or {}) do
+		local tag
+		if ns.Util.isCommunityClubMember(p.name) then
+			tag = ns.Util.isGuildClubMember(p.name) and " [C+G]" or " [C]"
+		elseif ns.Util.isGuildClubMember(p.name) then
+			tag = " [G]"
+		else
+			tag = " [?]" -- in neither club's current roster (left / stale)
+		end
+		if p.ign ~= 0 and (now - p.ign) < C.RELAY_IGNORE_TTL then
+			ignored = ignored + 1
+		elseif p.conf ~= 0 and (now - p.conf) < C.RELAY_CONFIRM_TTL then
+			conf[#conf + 1] = p.name .. tag
+		elseif p.pr > 0 then
+			probing[#probing + 1] = p.name .. tag
+		end
+	end
+	ns.Print("known relays (confirmed FRP): " .. joined(conf))
+	ns.Print(("relay probes — probing: %s | ignored: %d"):format(joined(probing), ignored))
 	ns.Print("xfac contacts (reachable, unconfirmed): " .. joined(mapNames(b.xfacContacts)))
 	ns.Print(("roster candidates: %d community / %d guild"):format(
 		#ns.Util.xfacClubMembers(), #ns.Util.xfacGuildMembers()))
+	-- Raw club-membership counts (all factions, not just xfac candidates):
+	-- distinguishes "guild club never scanned" (0) from "members scanned but
+	-- none opposite-faction" (>0 while candidates stay 0).
+	local r = ns.Util._roster and ns.Util._roster()
+	if r then
+		ns.Print(("roster membership — community: %d | guild: %d | built %ds ago"):format(
+			mapSize(r.communityByName), mapSize(r.guildByName),
+			math.floor(GetTime() - (r.at or 0))))
+	end
 	local lists = ns.comms and ns.comms:bnetPeerLists() or { confirmed = {}, probing = {}, ignored = {} }
+	-- Resolve confirmed BNet accounts to character names where the API allows.
+	local bnetConf = {}
+	for _, id in ipairs(lists.confirmed) do
+		local name
+		if type(BNGetGameAccountInfo) == "function" then
+			local ok, info = pcall(BNGetGameAccountInfo, id)
+			local char = ok and info and info.characterName
+			if char and char ~= "" and canaccessvalue(char) then
+				local realm = info.realmName
+				name = (realm and realm ~= "") and (char .. "-" .. realm) or char
+			end
+		end
+		bnetConf[#bnetConf + 1] = name or tostring(id)
+	end
 	ns.Print(("bnet peers — confirmed: %s | probing: %s | ignored: %d"):format(
-		joined(lists.confirmed), joined(lists.probing), #lists.ignored))
-	ns.Print(("exchange — pending requests: %d | pending serves: %d"):format(
-		mapSize(b.requests or {}), mapSize(b.pendingServes or {})))
+		joined(bnetConf), joined(lists.probing), #lists.ignored))
+	local mute = ""
+	if b.serveMuteUntil and GetTime() < b.serveMuteUntil then
+		mute = (" | serve muted %ds"):format(math.ceil(b.serveMuteUntil - GetTime()))
+	end
+	ns.Print(("exchange — pending requests: %d | pending serves: %d%s"):format(
+		mapSize(b.requests or {}), mapSize(b.pendingServes or {}), mute))
 	local p = b.lastLegPicks
 	ns.Print(("last fanout — community: %s | guild: %s | bnet: %s | pinned: %s"):format(
 		joined(p.community), joined(p.guild), joined(p.bnet), joined(p.pinned)))
@@ -239,7 +286,7 @@ end, "Show learned relays/contacts and the last fanout's chosen targets")
 -- Richer status command (overrides the placeholder registered in Core).
 ns.RegisterCommand("status", function()
 	local adapter = ns.getAvailableAdapter()
-	local relays = ns.broadcast and mapSize(ns.broadcast.knownRelays) or 0
+	local relays = ns.broadcast and mapSize(ns.broadcast.relays) or 0
 	local contacts = ns.broadcast and mapSize(ns.broadcast.xfacContacts) or 0
 	local enabledCats = {}
 	local d = ns.db and ns.db.debug

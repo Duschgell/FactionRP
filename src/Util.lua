@@ -43,13 +43,9 @@ end
 
 --- Build the "Name-Realm" identifier for a unit, matching the convention used
 -- by RP AddOns for keying their character store.
---
--- NOTE: realm names are normalized by stripping spaces (e.g. "Argent Dawn" ->
--- "ArgentDawn"). The TRP3 adapter prefers TRP3's own unit-id helper when
--- available (see TRP3Adapter) so register keys match exactly; this generic
--- version is the fallback used for our own bookkeeping.
--- @param unit string A unit token (e.g. "mouseover", "target", "player").
--- @return string|nil "Name-Realm", or nil if the unit is not a player.
+
+local REALM_STRIP = "[%s%-%.]+"
+
 function Util.getUnitID(unit)
 	if not UnitIsPlayer(unit) then
 		return nil
@@ -61,7 +57,7 @@ function Util.getUnitID(unit)
 	if not realm or realm == "" then
 		realm = GetNormalizedRealmName()
 	else
-		realm = realm:gsub("%s+", "")
+		realm = realm:gsub(REALM_STRIP, "")
 	end
 	return name .. "-" .. realm
 end
@@ -119,7 +115,7 @@ local function normalizeUnitName(name)
 	if not realm or realm == "" then
 		realm = GetNormalizedRealmName() or ""
 	else
-		realm = realm:gsub("%s+", "")
+		realm = realm:gsub(REALM_STRIP, "")
 	end
 	return (char .. "-" .. realm):lower()
 end
@@ -138,7 +134,7 @@ local function fullUnitName(name)
 	if not realm or realm == "" then
 		realm = GetNormalizedRealmName() or ""
 	else
-		realm = realm:gsub("%s+", "")
+		realm = realm:gsub(REALM_STRIP, "")
 	end
 	return char .. "-" .. realm
 end
@@ -172,7 +168,8 @@ local function rosterTables()
 		guidByName = {},    -- normalized name -> GUID
 		nameByGuid = {},    -- GUID -> display "Name-Realm" (request serving)
 		guildByName = {},   -- normalized name -> true (guild members)
-		communityByName = {} -- normalized name -> true (community members)
+		communityByName = {}, -- normalized name -> true (community members)
+		onlineByName = {},  -- normalized name -> true (logged-in members)
 	}
 end
 
@@ -201,6 +198,20 @@ local function finishRosterBuild(build)
 		rebuildRetryAt = GetTime() + C.ROSTER_RETRY
 		rosterBuild = nil
 		return
+	end
+	-- Deferred members (online, faction unknown at their scan point): classify
+	-- now that every club's faction claims are accumulated.
+	for _, d in ipairs(build.deferred) do
+		local f = build.target.factionByName[d.key]
+		if f ~= nil and f ~= selfFaction() then
+			local list = d.guild and build.target.xfacGuild or build.target.xfac
+			local seen = d.guild and buildSeenGuild or buildSeenXfac
+			local dk = d.guid or d.key
+			if not seen[dk] then
+				seen[dk] = true
+				list[#list + 1] = d.name
+			end
+		end
 	end
 	-- The build wrote into the back buffer; publish it by swapping buffers.
 	rosterBack.at = GetTime()
@@ -245,8 +256,8 @@ local function stepRosterBuild(build)
 					local t = build.target
 					if info.faction ~= nil then
 						build.sawFaction = true
+						t.factionByName[key] = info.faction
 					end
-					t.factionByName[key] = info.faction -- may be nil
 					if club.guild then
 						t.guildByName[key] = true
 					else
@@ -255,18 +266,30 @@ local function stepRosterBuild(build)
 					if info.guid and canaccessvalue(info.guid) then
 						t.guidByName[key] = info.guid
 						t.nameByGuid[info.guid] = fullUnitName(info.name)
-						if info.faction ~= nil
-							and info.faction ~= selfFaction()
-							and PRESENCE_ONLINE[info.presence]
-						then
+					end
+					if PRESENCE_ONLINE[info.presence] then
+						t.onlineByName[key] = true
+						-- A member's faction can be absent on *this* club's
+						-- record (guild rosters don't always populate it): any
+						-- club's claim counts. Still-unknown members defer to
+						-- end-of-build so a later club's record can supply it.
+						local faction = info.faction or t.factionByName[key]
+						if faction ~= nil and faction ~= selfFaction() then
 							-- Dedup per leg: a member in the guild AND a
 							-- community is a candidate in both lists.
 							local list = club.guild and t.xfacGuild or t.xfac
 							local seen = club.guild and buildSeenGuild or buildSeenXfac
-							if not seen[info.guid] then
-								seen[info.guid] = true
+							local dk = info.guid or key
+							if not seen[dk] then
+								seen[dk] = true
 								list[#list + 1] = fullUnitName(info.name)
 							end
+						elseif faction == nil then
+							build.deferred[#build.deferred + 1] = {
+								key = key, guid = info.guid,
+								name = fullUnitName(info.name),
+								guild = club.guild == true,
+							}
 						end
 					end
 				end
@@ -330,10 +353,12 @@ local function startRosterBuild()
 	wipe(back.nameByGuid)
 	wipe(back.guildByName)
 	wipe(back.communityByName)
+	wipe(back.onlineByName)
 	wipe(buildSeenXfac)
 	wipe(buildSeenGuild)
 	rosterBuild = {
 		clubs = list, c = 1, m = 1, members = nil, target = back,
+		deferred = {},
 	}
 	stepRosterBuild(rosterBuild)
 end
@@ -376,6 +401,13 @@ function Util.isGuildClubMember(unitID)
 	return key ~= nil and clubRoster().guildByName[key] == true
 end
 
+--- Whether a "Name-Realm" is a club member currently logged in (per the
+-- roster memo's presence field — mobile-app presences count as offline).
+function Util.isClubMemberOnline(unitID)
+	local key = normalizeUnitName(unitID)
+	return key ~= nil and clubRoster().onlineByName[key] == true
+end
+
 --- Whether a "Name-Realm" is a member of one of our (non-guild) communities.
 function Util.isCommunityClubMember(unitID)
 	local key = normalizeUnitName(unitID)
@@ -386,6 +418,25 @@ end
 -- Used to resolve request subjects to extractable unit IDs.
 function Util.unitForGuid(guid)
 	return guid and clubRoster().nameByGuid[guid] or nil
+end
+
+--- Reverse lookup via the client's own player-info cache
+-- (GetPlayerInfoByGUID -> name + normalizedRealmName).
+-- @param guid string
+-- @return string|nil "Name-Realm", or nil if the GUID is unknown to the client.
+function Util.unitForGuidFromClient(guid)
+	if not guid or not GetPlayerInfoByGUID then
+		return nil
+	end
+	-- May fail outright or yield secret values during lockdown.
+	local ok, _, _, _, _, _, name, realm = pcall(GetPlayerInfoByGUID, guid)
+	if not ok
+		or not name or name == "" or not canaccessvalue(name)
+		or (realm ~= nil and not canaccessvalue(realm))
+	then
+		return nil
+	end
+	return fullUnitName((realm and realm ~= "") and (name .. "-" .. realm) or name)
 end
 
 local function guidFromUnits(unitID)

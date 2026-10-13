@@ -1,5 +1,38 @@
 ﻿# FactionRP Changelog
 
+## 0.3.1
+
+### Changed
+- Messages have been slowed way the hell down.
+- FRP now handshakes passively with potential relays, rather than fanning out on demand.
+  This does have the effect of slowing down the rate of profiles when the mesh is thin.
+- If too many serves are granted within 30 seconds, stop answering REQs
+  until the cooldown expires. `/frp relays` will show the mute countdown.
+- `REQ` now includes subject unitID alongside GUID for validation.
+  This helps serve profiles you haven't seen this session if they're already
+  in the register.
+- Outbound send rate reduced to `SEND_RATE` = 1 chunk/sec.
+- Whisper relays are now actively probed (`HELLO`/`HI` over addon whispers,
+  same lifecycle as BNet): candidates are probed in bursts of 3 every 2 min,
+  confirmed relays are re-probed to stay fresh, and targets that ignore 3
+  probes are skipped for 30 min. `/frp relays` shows probing/ignored buckets.
+- `COMM_RELAY_LIMIT`/`GUILD_RELAY_LIMIT` halved to 5 each — relay lists are
+  maintained per client, so request coverage is distributed across the mesh.
+- `REQ` whisper legs now reach only confirmed relays and known xfac
+  contacts — unproven roster candidates are left to the probe rotation, so
+  a request never whispers strangers.
+- Relays/contacts are skipped while the roster marks them offline, and
+  `/frp relays` badges each whisper relay with its leg membership
+  (`[C]`/`[G]`/`[C+G]`) and resolves BNet accounts to character names.
+- Roster fix: a factionless guild record no longer hides cross-faction
+  guild members — faction claims accumulate across clubs, unknown members
+  defer to end-of-build.
+- Probe fairness: never-probed candidates are targeted before re-probes
+  (was front-of-roster-first, which starved deeper candidates until the
+  front ones were ignored); guild members probe before community.
+- Realm normalisation now strips spaces, hyphens and periods.
+
+
 ## 0.3.0
 
 ### Changed — pull model (breaking protocol change)
