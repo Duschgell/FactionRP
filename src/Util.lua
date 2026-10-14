@@ -539,3 +539,60 @@ end
 function Util._guidMemo()
 	return guidMemo
 end
+
+--- Retarget FRP messages still queued in CTL after channel reorder,
+--- so that the queue sends to the correct channel.
+function Util.fixChompChannelTargets(channelInx)
+	if type(channelInx) ~= "number" or channelInx == 0 then
+		return
+	end
+	local debug = ns.debugEnabled("reorders")
+	if debug then
+		ns.Print("fixChompChannelTargets, index: " .. channelInx)
+	end
+	local ctl = ChatThrottleLib
+	if not ctl or type(ctl.Prio) ~= "table" then
+		-- if it doesn't exist or if something corrupted ctl.Prio into a non-table,
+		-- fuck off
+		return
+	end
+	local rewritten = 0
+	local currentId = {}
+	local function findUniqueNums()
+		local seen, out = {}, {}
+		for i = 1, #currentId do
+			local id = currentId[i]
+			if id and not seen[id] then
+				seen[id] = true
+				out[#out + 1] = tostring(id)
+			end
+		end
+		return table.concat(out, ", ")
+	end
+	-- Find FRP's messages in the pipeline and edit targets in place
+	if debug then 
+		ns.Print("Looping ctl.Prio")
+	end
+	for _, prio in pairs(ctl.Prio) do
+		for _, pipe in pairs(prio.ByName or {}) do
+			for i = 1, #pipe do
+				local msg = pipe[i]
+				if type(msg) == "table" and msg[1] == C.MSG_PREFIX and msg[3] == "CHANNEL" then
+					rewritten = rewritten + 1
+					if debug then
+						currentId[#currentId + 1] =  msg[4] or 0
+					end
+					-- we still want to fix and send nils
+					-- msg.n == 3 if channel was nil
+					if msg.n == 3 then
+						msg.n = 4
+					end
+					msg[4] = channelInx
+				end
+			end
+		end
+	end
+	if rewritten > 0 and debug then
+		ns.Print("Rewrote " .. rewritten .. " from channels " .. findUniqueNums() .. " to channel " .. channelInx)
+	end
+end
