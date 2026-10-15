@@ -24,7 +24,7 @@ local Broadcast = ns.Class("Broadcast")
 ns.Broadcast = Broadcast
 
 function Broadcast:init()
-	self.playerGUID = nil -- resolved at login
+	self.playerGUID = nil -- refreshed per use by senderGUID()
 	-- Cross-faction relay lifecycle (session-only), keyed by normalized
 	-- "name-realm" — same probe/confirm/ignore shape as BNet peers:
 	--   relays[key] = {
@@ -76,6 +76,7 @@ function Broadcast:init()
 	self.recentReqs = {}
 	self.pendingServes = {}
 	self.relayProbeAt = 0 -- last whisper probe burst
+	self.probeCursor = 0 -- rotating index into the flattened probe rosters
 
 	-- Outbound serve breaker (fixed window): once SERVE_RATE_LIMIT granted
 	-- serves land inside SERVE_RATE_WINDOW we stop answering REQs until
@@ -85,8 +86,17 @@ function Broadcast:init()
 	self.serveMuteUntil = 0
 end
 
+--- Own GUID, fetched fresh and validated on every use. A nil result
+-- degrades sends to encode_fail rather than stamping a bad sender.
+-- @return string|nil
+function Broadcast:senderGUID()
+	local guid = UnitGUID("player")
+	self.playerGUID = Util.canWeUse(guid) and guid or nil
+	return self.playerGUID
+end
+
 function Broadcast:start()
-	self.playerGUID = UnitGUID("player")
+	self:senderGUID()
 	ns.comms:setMessageHandler(function(raw, context)
 		self:onMessage(raw, context)
 	end)
@@ -166,50 +176,40 @@ function Broadcast:relayIgnored(key, now)
 	return p ~= nil and p.ign ~= 0 and (now - p.ign) < C.RELAY_IGNORE_TTL
 end
 
---- Next whisper-probe target, in priority order: never-probed candidates
--- first (everyone gets a turn before anyone is re-probed), then the
--- longest-since-probed unconfirmed candidate, then the stalest confirmed
--- relay past half its TTL (keepalive so quiet-but-alive peers stay
--- confirmed). Guild members are scanned before community members — they
--- are the closer tie and the smaller list.
+--- Next probe target via rotating cursor over both rosters, allowing
+--- new targets to be probed in sequence and not get stuck trying to probe
+--- the same people until ignored.
 function Broadcast:whisperProbeTarget(now)
-	local oldKey, oldName, oldLp
-	local staleKey, staleName, staleAt
-	for _, roster in ipairs({ Util.xfacGuildMembers(), Util.xfacClubMembers() }) do
-		for _, name in ipairs(roster) do
-			local key = Util.normalizeUnitName(name)
-			if key then
-				local p = self.relays[key]
-				if p and p.ign ~= 0 and (now - p.ign) >= C.RELAY_IGNORE_TTL then
-					p.ign, p.pr = 0, 0 -- served their time: fresh slate
-				end
-				local ignored = p and p.ign ~= 0
-				if not ignored then
-					local fresh = p and p.conf ~= 0
-						and (now - p.conf) < C.RELAY_CONFIRM_TTL
-					if not fresh then
-						if not p or p.lp == 0 then
-							return key, name -- never probed
-						end
-						if (now - p.lp) >= C.RELAY_PROBE_COOLDOWN
-							and (not oldLp or p.lp < oldLp)
-						then
-							oldKey, oldName, oldLp = key, name, p.lp
-						end
-					elseif (now - p.conf) >= C.RELAY_CONFIRM_TTL * 0.5
-						and (now - p.lp) >= C.RELAY_PROBE_COOLDOWN
-						and (not staleAt or p.conf < staleAt)
-					then
-						staleKey, staleName, staleAt = key, name, p.conf
-					end
+	local guildRoster = Util.xfacGuildMembers()
+	local commRoster = Util.xfacClubMembers()
+	local gn = #guildRoster
+	local total = gn + #commRoster
+	if total == 0 then
+		return
+	end
+	for step = 1, total do
+		local idx = ((self.probeCursor + step - 1) % total) + 1
+		local name = idx <= gn and guildRoster[idx] or commRoster[idx - gn]
+		local key = Util.normalizeUnitName(name)
+		if key then
+			local p = self.relays[key]
+			if p and p.ign ~= 0 and (now - p.ign) >= C.RELAY_IGNORE_TTL then
+				p.ign, p.pr = 0, 0 -- served their time: fresh slate
+			end
+			if not (p and p.ign ~= 0) then
+				local fresh = p and p.conf ~= 0
+					and (now - p.conf) < C.RELAY_CONFIRM_TTL
+				local due = not p or p.lp == 0
+					or (now - p.lp) >= C.RELAY_PROBE_COOLDOWN
+				if due and (not fresh
+					or (now - p.conf) >= C.RELAY_CONFIRM_TTL * 0.5)
+				then
+					self.probeCursor = idx
+					return key, name
 				end
 			end
 		end
 	end
-	if oldKey then
-		return oldKey, oldName
-	end
-	return staleKey, staleName
 end
 
 --- One leg's selection: confirmed FRP relays and known xfac contacts first
@@ -392,12 +392,9 @@ end
 
 -- Control channel -----------------------------------------------------------
 
---- Own "Name-Realm", resolved lazily (UnitName may be secret at load).
-local function ownUnitID(broadcast)
-	if not broadcast.playerUnitID then
-		broadcast.playerUnitID = Util.getUnitID("player")
-	end
-	return broadcast.playerUnitID or ""
+--- Own "Name-Realm", validated inside getUnitID each call.
+local function ownUnitID()
+	return Util.getUnitID("player") or nil
 end
 
 --- Build (and chunk) a control envelope: subject "_frp", data "FRP1 <verb>
@@ -405,9 +402,9 @@ end
 -- @return table Chunk list.
 function Broadcast:buildCtl(verb, arg)
 	local message = Serializer.buildMessage({
-		sender = self.playerGUID,
+		sender = self:senderGUID(),
 		subject = C.CTL_SUBJECT,
-		unitID = ownUnitID(self),
+		unitID = ownUnitID(),
 		addon = "FRP",
 		originTime = time(),
 		contentVersion = "0",
@@ -580,7 +577,7 @@ function Broadcast:serveData(serve)
 		return
 	end
 	local message = Serializer.buildMessage({
-		sender = self.playerGUID,
+		sender = self:senderGUID(),
 		subject = serve.subject,
 		unitID = serve.unitID,
 		addon = profile.addon,
@@ -754,10 +751,10 @@ function Broadcast:onControl(msg, context)
 		-- servability check below reads the RP AddOn's register live, so a
 		-- subject absent from our cache is still servable whenever the
 		-- register holds their profile.
-		local selfReq = (arg == self.playerGUID)
+		local selfReq = (arg == self:senderGUID())
 		local unitID
 		if selfReq then
-			unitID = ownUnitID(self)
+			unitID = ownUnitID()
 		else
 			unitID = self:resolveSubject(arg, arg2)
 		end
@@ -827,7 +824,7 @@ function Broadcast:onControl(msg, context)
 			self.pendingServes[key] = nil
 			-- Granted serves are what the breaker meters — a NOK'd ACK
 			-- never cost real work. Self-serves don't count (breaker-bypassed).
-			if serve.subject ~= self.playerGUID then
+			if serve.subject ~= self:senderGUID() then
 				self:bumpServe(now)
 			end
 			self:serveData(serve)
@@ -891,7 +888,7 @@ function Broadcast:onMessage(raw, context)
 	end
 
 	-- Loop avoidance: ignore our own traffic echoed back to us.
-	if msg.sender == self.playerGUID then
+	if msg.sender == self:senderGUID() then
 		if ns.statsError then
 			ns.statsError("self_echo")
 		end
@@ -1009,7 +1006,7 @@ end
 -- Dedup'd by GUID: a newer copy replaces any older pending one.
 function Broadcast:queueInject(candidate)
 	-- Our own profile is already authoritative locally; never inject it back.
-	if candidate.guid == self.playerGUID then
+	if candidate.guid == self:senderGUID() then
 		return
 	end
 	if not self.injectQueue[candidate.guid] then

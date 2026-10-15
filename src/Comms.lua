@@ -238,14 +238,20 @@ end
 
 --- Release queued sends at C.SEND_RATE chunks/second. A fractional token
 --- bucket keeps fractional rates smooth (7.5/s releases 1,2,1,2,... per
---- 0.2s tick); credit is capped at SEND_RATE so an idle queue cannot bank
---- an unbounded burst. Invoked on a timer.
+--- 0.2s tick); credit is capped at max(SEND_RATE, 1) -- one send's worth --
+--- so an idle queue cannot bank an unbounded burst and sub-1/s rates can
+--- still accumulate a send. The 1e-6 tolerance absorbs float accrual
+--- (0.1*10 ~= 1.0 in binary). Invoked on a timer.
 function Comms:flushQueue()
+	-- Hold all sends while our own GUID is unreadable.
+	if not ns.Util.canWeUse(UnitGUID("player")) then
+		return
+	end
 	local q = self.queue
 	local head = q.head
-	self.sendCredit = math.min(self.sendCredit + C.SEND_RATE * C.SEND_INTERVAL, C.SEND_RATE)
+	self.sendCredit = math.min(self.sendCredit + C.SEND_RATE * C.SEND_INTERVAL, math.max(C.SEND_RATE, 1))
 	local sent = 0
-	while (self.sendCredit - sent) >= 1 and head <= q.tail do
+	while (self.sendCredit - sent) >= (1 - 1e-6) and head <= q.tail do
 		local desc = q[head]
 		q[head] = nil
 		head = head + 1
@@ -370,18 +376,24 @@ function Comms:eachBNetGameAccount(callback)
 	if BNFeaturesEnabledAndConnected and not BNFeaturesEnabledAndConnected() then
 		return
 	end
-	local numFriends = BNGetNumFriends() or 0
-	for i = 1, numFriends do
-		local numAccounts = C_BattleNet.GetFriendNumGameAccounts(i) or 0
-		for j = 1, numAccounts do
-			local acct = C_BattleNet.GetFriendGameAccountInfo(i, j)
-			if acct
-				and acct.gameAccountID
-				and acct.isOnline
-				and acct.clientProgram == BNET_CLIENT_WOW
-				and acct.isInCurrentRegion
-			then
-				callback(acct.gameAccountID)
+	local numFriends = BNGetNumFriends()
+	if not ns.Util.canWeUse(numFriends) then
+		return
+	end
+	for i = 1, numFriends or 0 do
+		local numAccounts = C_BattleNet.GetFriendNumGameAccounts(i)
+		if ns.Util.canWeUse(numAccounts) then
+			for j = 1, numAccounts or 0 do
+				local acct = C_BattleNet.GetFriendGameAccountInfo(i, j)
+				if ns.Util.fieldsUsable(acct,
+						"gameAccountID", "isOnline", "clientProgram", "isInCurrentRegion")
+					and acct.gameAccountID
+					and acct.isOnline
+					and acct.clientProgram == BNET_CLIENT_WOW
+					and acct.isInCurrentRegion
+				then
+					callback(acct.gameAccountID)
+				end
 			end
 		end
 	end

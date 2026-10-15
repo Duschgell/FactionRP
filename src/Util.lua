@@ -47,15 +47,22 @@ end
 local REALM_STRIP = "[%s%-%.]+"
 
 function Util.getUnitID(unit)
-	if not UnitIsPlayer(unit) then
+	if not Util.canWeUse(unit) then
 		return nil
 	end
+	-- The token checks out, but the results themselves can still be secret.
+	local isPlayer = UnitIsPlayer(unit)
 	local name, realm = UnitName(unit)
-	if not name or name == "" then
+	if not Util.canWeUse(isPlayer, name, realm)
+		or not isPlayer or not name or name == ""
+	then
 		return nil
 	end
 	if not realm or realm == "" then
 		realm = GetNormalizedRealmName()
+		if not Util.canWeUse(realm) then
+			return nil
+		end
 	else
 		realm = realm:gsub(REALM_STRIP, "")
 	end
@@ -66,11 +73,15 @@ end
 -- @param unit string A unit token.
 -- @return boolean
 function Util.isOppositeFaction(unit)
-	if not UnitIsPlayer(unit) then
+	if not Util.canWeUse(unit) then
 		return false
 	end
+	local isPlayer = UnitIsPlayer(unit)
 	local theirs = UnitFactionGroup(unit)
 	local mine = UnitFactionGroup("player")
+	if not Util.canWeUse(isPlayer, theirs, mine) or not isPlayer then
+		return false
+	end
 	-- UnitFactionGroup returns "Alliance"/"Horde"/"Neutral"/nil. Treat any
 	-- mismatch between two known, differing groups as opposite faction.
 	return theirs ~= nil and mine ~= nil and theirs ~= mine
@@ -105,7 +116,7 @@ end
 -- @param name string "Name" or "Name-Realm".
 -- @return string|nil
 local function normalizeUnitName(name)
-	if not name or name == "" then
+	if not Util.canWeUse(name) or not name or name == "" then
 		return nil
 	end
 	local char, realm = name:match("^([^-]+)-?(.*)$")
@@ -124,7 +135,7 @@ Util.normalizeUnitName = normalizeUnitName
 --- Same normalization as normalizeUnitName but preserving case: produces the
 --- "Name-Realm" form suitable for a whisper target.
 local function fullUnitName(name)
-	if not name or name == "" then
+	if not Util.canWeUse(name) or not name or name == "" then
 		return nil
 	end
 	local char, realm = name:match("^([^-]+)-?(.*)$")
@@ -183,10 +194,42 @@ local rosterBuild = nil -- incremental build state, or nil when idle
 local rebuildRetryAt = 0  -- no rebuild before this time (suspect-build retry)
 -- Per-build dedup scratch, persistent and wiped at each build start.
 local buildSeenXfac, buildSeenGuild = {}, {}
+-- Consecutive builds discarded by the suspect-faction guard; capped so a
+-- client that never populates `faction` does not retry the build forever.
+local suspectBuilds = 0
 
 -- ClubMemberInfo.faction is a PvPFaction (0 = Horde, 1 = Alliance, NeverSecret).
 local function selfFaction()
-	return (UnitFactionGroup("player") == "Alliance") and 1 or 0
+	local f = UnitFactionGroup("player")
+	return Util.canWeUse(f) and f == "Alliance" and 1 or 0
+end
+
+-- raceID -> PvPFaction, memoized: race determines faction unambiguously
+-- (dual-faction races use distinct raceIDs). Sole faction source —
+-- ClubMemberInfo.faction arrives absent on the current client.
+local raceFaction = {}
+local function factionFromRace(race)
+	if type(race) ~= "number" or not Util.canWeUse(race) then
+		return nil
+	end
+	local f = raceFaction[race]
+	if f == nil then
+		local info = C_CreatureInfo and C_CreatureInfo.GetFactionInfo
+			and C_CreatureInfo.GetFactionInfo(race)
+		local tag = type(info) == "table" and Util.canWeUse(info.groupTag)
+			and info.groupTag
+		f = (tag == "Alliance") and 1 or (tag == "Horde") and 0 or false
+		raceFaction[race] = f
+	end
+	return f ~= false and f or nil
+end
+
+local function mapCount(t)
+	local n = 0
+	for _ in pairs(t) do
+		n = n + 1
+	end
+	return n
 end
 
 local function finishRosterBuild(build)
@@ -195,9 +238,18 @@ local function finishRosterBuild(build)
 	-- the whisper legs an empty roster for a whole memo window, so keep the
 	-- old roster and retry shortly instead.
 	if not build.sawFaction and next(build.target.guidByName) then
-		rebuildRetryAt = GetTime() + C.ROSTER_RETRY
-		rosterBuild = nil
-		return
+		suspectBuilds = suspectBuilds + 1
+		if suspectBuilds < 3 then
+			rebuildRetryAt = GetTime() + C.ROSTER_RETRY
+			rosterBuild = nil
+			if ns.debugPeer then
+				ns.debugPeer("roster build suspect (guids but no factions) — retrying")
+			end
+			return
+		end
+		if ns.debugPeer then
+			ns.debugPeer("roster build suspect — publishing anyway (no faction data)")
+		end
 	end
 	-- Deferred members (online, faction unknown at their scan point): classify
 	-- now that every club's faction claims are accumulated.
@@ -217,6 +269,13 @@ local function finishRosterBuild(build)
 	rosterBack.at = GetTime()
 	rosterFront, rosterBack = rosterBack, rosterFront
 	rosterBuild = nil
+	suspectBuilds = 0
+	if ns.debugPeer then
+		ns.debugPeer(("roster published: %d guild / %d community / %d xfac"):format(
+			mapCount(rosterFront.guildByName),
+			mapCount(rosterFront.communityByName),
+			#rosterFront.xfac + #rosterFront.xfacGuild))
+	end
 end
 
 -- Forward declaration: stepRosterBuild reschedules via stepCurrentBuild,
@@ -238,42 +297,60 @@ local function stepRosterBuild(build)
 		end
 		if not build.members then
 			local ok, members = pcall(C_Club.GetClubMembers, club.id)
+			if ok and not Util.canWeUse(members) then
+				rebuildRetryAt = GetTime() + C.ROSTER_RETRY
+				rosterBuild = nil
+				if ns.debugPeer then
+					ns.debugPeer("roster build aborted: secret members (club "
+						.. tostring(club.id) .. ")")
+				end
+				return
+			end
 			build.members = (ok and type(members) == "table") and members or {}
 			build.m = 1
+			if ns.debugPeer then
+				ns.debugPeer("roster club " .. tostring(club.id) .. " -> "
+					.. #build.members .. " members")
+			end
 		end
 		local memberId = build.members[build.m]
-		if not memberId then
+		if not Util.canWeUse(memberId) then
+			-- Sporadically secret element: skip the member, keep building.
+			build.m = build.m + 1
+			budget = budget - 1
+		elseif not memberId then
 			build.members = nil
 			build.c = build.c + 1
 		else
 			build.m = build.m + 1
 			budget = budget - 1
-			-- Club APIs can fail before init or yield secrets during lockdown.
 			local okInfo, info = pcall(C_Club.GetMemberInfo, club.id, memberId)
-			if okInfo and info and not info.isSelf and info.name and canaccessvalue(info.name) then
+			if okInfo and Util.fieldsUsable(info, "isSelf", "name", "guid", "presence")
+				and not info.isSelf and info.name then
 				local key = normalizeUnitName(info.name)
 				if key then
 					local t = build.target
-					if info.faction ~= nil then
+					local faction = factionFromRace(info.race)
+					if faction ~= nil then
 						build.sawFaction = true
-						t.factionByName[key] = info.faction
+						t.factionByName[key] = faction
 					end
 					if club.guild then
 						t.guildByName[key] = true
 					else
 						t.communityByName[key] = true
 					end
-					if info.guid and canaccessvalue(info.guid) then
+					if info.guid then
 						t.guidByName[key] = info.guid
 						t.nameByGuid[info.guid] = fullUnitName(info.name)
 					end
 					if PRESENCE_ONLINE[info.presence] then
 						t.onlineByName[key] = true
 						-- A member's faction can be absent on *this* club's
-						-- record (guild rosters don't always populate it): any
-						-- club's claim counts. Still-unknown members defer to
+						-- record (race doesn't always populate): any club's
+						-- claim counts. Still-unknown members defer to
 						-- end-of-build so a later club's record can supply it.
-						local faction = info.faction or t.factionByName[key]
+						local faction = t.factionByName[key]
 						if faction ~= nil and faction ~= selfFaction() then
 							-- Dedup per leg: a member in the guild AND a
 							-- community is a candidate in both lists.
@@ -319,7 +396,11 @@ local function startRosterBuild()
 		return
 	end
 	local ok, clubs = pcall(C_Club.GetSubscribedClubs)
-	if not ok or type(clubs) ~= "table" then
+	if not ok or type(clubs) ~= "table" or not Util.canWeUse(clubs) then
+		if ns.debugPeer then
+			ns.debugPeer("roster build skipped: GetSubscribedClubs "
+				.. (not ok and "failed" or "unusable"))
+		end
 		return
 	end
 	-- Our own guild is a club too (C_Club.GetGuildClubId) and gets the same
@@ -327,11 +408,17 @@ local function startRosterBuild()
 	-- whisper-reachable. It is kept as a separate target list.
 	local list = {}
 	for _, club in ipairs(clubs) do
-		local isGuild = Enum and Enum.ClubType and club.clubType == Enum.ClubType.Guild
-		list[#list + 1] = { id = club.clubId, guild = isGuild or nil }
+		if Util.fieldsUsable(club, "clubId", "clubType") then
+			local isGuild = Enum and Enum.ClubType and club.clubType == Enum.ClubType.Guild
+			list[#list + 1] = { id = club.clubId, guild = isGuild or nil }
+		end
 	end
 	local okGuild, guildClubId = pcall(C_Club.GetGuildClubId)
-	if okGuild and guildClubId then
+	if ns.debugPeer then
+		ns.debugPeer("roster clubs: " .. #list .. " subscribed, guild club "
+			.. tostring(okGuild and guildClubId or nil))
+	end
+	if okGuild and Util.canWeUse(guildClubId) and guildClubId then
 		local found = false
 		for _, club in ipairs(list) do
 			if club.id == guildClubId then
@@ -430,9 +517,8 @@ function Util.unitForGuidFromClient(guid)
 	end
 	-- May fail outright or yield secret values during lockdown.
 	local ok, _, _, _, _, _, name, realm = pcall(GetPlayerInfoByGUID, guid)
-	if not ok
-		or not name or name == "" or not canaccessvalue(name)
-		or (realm ~= nil and not canaccessvalue(realm))
+	if not ok or not Util.canWeUse(name, realm)
+		or not name or name == ""
 	then
 		return nil
 	end
@@ -443,9 +529,9 @@ local function guidFromUnits(unitID)
 	for _, token in ipairs(GUID_UNIT_TOKENS) do
 		-- Unit APIs may yield secret values during lockdown; skip those.
 		local ok, guid = pcall(UnitGUID, token)
-		if ok and guid and not issecretvalue(guid) then
+		if ok and Util.canWeUse(guid) and guid then
 			local okID, id = pcall(Util.getUnitID, token)
-			if okID and id and id:lower() == unitID then
+			if okID and Util.canWeUse(id) and id and id:lower() == unitID then
 				return guid
 			end
 		end
@@ -459,19 +545,24 @@ local function guidFromBNetFriends(unitID)
 	if not C_BattleNet then
 		return
 	end
-	local numFriends = BNGetNumFriends() or 0
-	for i = 1, numFriends do
-		local numAccounts = C_BattleNet.GetFriendNumGameAccounts(i) or 0
-		for j = 1, numAccounts do
-			local acct = C_BattleNet.GetFriendGameAccountInfo(i, j)
-			if acct
-				and acct.clientProgram == BNET_CLIENT_WOW
-				and acct.characterName
-				and acct.realmName
-				and acct.playerGuid
-				and normalizeUnitName(acct.characterName .. "-" .. acct.realmName) == unitID
-			then
-				return acct.playerGuid
+	local numFriends = BNGetNumFriends()
+	if not Util.canWeUse(numFriends) then
+		return
+	end
+	for i = 1, numFriends or 0 do
+		local numAccounts = C_BattleNet.GetFriendNumGameAccounts(i)
+		if Util.canWeUse(numAccounts) then
+			for j = 1, numAccounts or 0 do
+				local acct = C_BattleNet.GetFriendGameAccountInfo(i, j)
+				if Util.fieldsUsable(acct, "clientProgram", "characterName", "realmName", "playerGuid")
+					and acct.clientProgram == BNET_CLIENT_WOW
+					and acct.characterName
+					and acct.realmName
+					and acct.playerGuid
+					and normalizeUnitName(acct.characterName .. "-" .. acct.realmName) == unitID
+				then
+					return acct.playerGuid
+				end
 			end
 		end
 	end
@@ -595,4 +686,35 @@ function Util.fixChompChannelTargets(channelInx)
 	if rewritten > 0 and debug then
 		ns.Print("Rewrote " .. rewritten .. " from channels " .. findUniqueNums() .. " to channel " .. channelInx)
 	end
+end
+
+--- False (+ index of the offender) if any supplied value is secret or
+--- inaccessible. A table result only certifies that it can be indexed.
+--- Fields could still be secret which is what we have Util.fieldsUsable() for.
+function Util.canWeUse(...)
+	for i = 1, select("#", ...) do
+		local v = select(i, ...)
+		if type(v) == "table" then
+			if not canaccesstable(v) then
+				return false, i
+			end
+		elseif not canaccessvalue(v) then
+			return false, i
+		end
+	end
+	return true
+end
+
+--- Check if supplied table is indexable and, if it is,
+--- discover whether the supplied fields contain secrets.
+function Util.fieldsUsable(t, ...)
+	if type(t) ~= "table" or not canaccesstable(t) then
+		return false
+	end
+	for i = 1, select("#", ...) do
+		if not canaccessvalue(t[select(i, ...)]) then
+			return false
+		end
+	end
+	return true
 end
