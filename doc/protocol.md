@@ -134,7 +134,7 @@ decode `data` as a profile, and drop it harmlessly.
 | `REQ`   | subjectGuid [unitID]| pull request — "who can serve this profile?"|
 | `ACK`   | subjectGuid         | "I can serve it"                            |
 | `OK`    | subjectGuid         | grant — "you may send it"                   |
-| `NOK`   | subjectGuid         | deny — "stand down"                         |
+| `NOK`   | subjectGuid         | cancel — winner mid-send, data landed elsewhere |
 
 `REQ` is the only two-argument verb: `unitID` is the subject's
 `"Name-Realm"` as computed by the requester's RP AddOn — the exact key its
@@ -175,20 +175,23 @@ Whisper peers (cross-faction club members) use the same probe/confirm/ignore
 lifecycle as BNet accounts:
 
 - **Probing**: bursts of up to `RELAY_PROBE_BURST` (5) whispered
-  `HELLO <ver>`s every `RELAY_PROBE_INTERVAL` (120s). Target priority is
-  never-probed candidates first, then the longest-since-probed
-  (`RELAY_PROBE_COOLDOWN`=45s floor), so every candidate gets a turn —
-  guild members are scanned before community members. A whispered `HELLO`
-  is answered `HI` (rate-limited per sender by `RELAY_HI_COOLDOWN`=30s).
+  `HELLO <ver>`s every `RELAY_PROBE_INTERVAL` (120s), walked in order by a
+  rotating cursor — guild members before community members, so every
+  candidate gets a turn and unanswered probes never repeat on the same
+  people. Each candidate gets exactly `RELAY_PROBE_MAX` (1) probe; a
+  whispered `HELLO` is answered `HI` (rate-limited per sender by
+  `RELAY_HI_COOLDOWN`=30s).
 - **Confirming**: any parseable inbound whisper from an opposite-faction
   club member — `HI`, `ACK`, `REQ`, or data — confirms them for
-  `RELAY_CONFIRM_TTL` (10min). Confirmed relays get fanout priority.
-- **Refreshing**: when no unconfirmed candidates remain, the stalest
-  confirmed relay past half its TTL is re-probed, so quiet-but-alive peers
-  stay confirmed and dead ones decay out of the list.
-- **Ignoring**: `RELAY_PROBE_MAX` (3) unanswered probes ignore a target for
-  `RELAY_IGNORE_TTL` (30min); expired ignores re-enter rotation with a
-  fresh slate. Ignored targets are skipped by `REQ` fanouts too.
+  `RELAY_CONFIRM_TTL` (10min) and clears probe/ignore state. Confirmed
+  relays get fanout priority and are never probed — real inbound traffic
+  is the only thing keeping them warm, so a relay that goes silent decays
+  back to unconfirmed on its own.
+- **Ignoring**: an unanswered probe past its answer window
+  (`RELAY_PROBE_COOLDOWN`=45s) kicks the target to the ignore list for
+  `RELAY_IGNORE_TTL` (2h) at the next rotation pass; expired ignores
+  re-enter rotation with a fresh slate — the slow recovery path. Ignored
+  targets are skipped by `REQ` fanouts too.
 
 `REQ` whisper legs reach only proven targets — confirmed relays and known
 xfac contacts; the unconfirmed roster is the probe rotation's job, so a
@@ -209,14 +212,27 @@ requester                                candidate servers
     │                                          └ can extract? → ACK
     │                                            cannot?  → silent
     │  ◄── ACK <guid> ── (first wins, direct to requester)
-    │  ── OK <guid> ──► winner only
-    │  ── NOK <guid> ─► every later ACKer
+    │  ── OK <guid> ──► winner only; later ACKers get
+    │                     silence — their pendingServe
+    │                     expires via SERVE_TIMEOUT
     │  ◄── data envelope ── winner serves direct
 ```
 
 **Requester rules**
 - Skip if the subject is already cached-fresh, a request is pending, or the
   subject is on `REQ_COOLDOWN` (60s) after a prior attempt.
+- Skip if the subject shares a club with us (community or guild): the RP
+  AddOn's own cross-faction whisper query already pulls that profile on
+  mouseover/target — a `REQ` would duplicate the native pull, whose landing
+  fills our cache via the received listener anyway.
+- Fanouts are globally paced: at most one `REQ` fanout per
+  `REQ_ISSUE_INTERVAL` (4s). Initiated sends — `REQ` fanouts and `HELLO`
+  probes — also share an in-flight budget: no more than
+  `FANOUT_INFLIGHT_MAX` (3) may occupy the send queue at once, so a new
+  send waits for earlier chunks to drain. Sightings that arrive sooner
+  wait in a dedup'd FIFO (`REQ_BACKLOG_CAP`=8, oldest dropped on
+  overflow) and are re-validated on release — a subject cached or served
+  while waiting never sends.
 - At most `REQ_MAX_PENDING` (32) outstanding requests.
 - `open` state expires after `REQ_ACK_TIMEOUT` (15s) without an ACK;
   `awaiting-data` expires after `REQ_DATA_TIMEOUT` (30s) without data.
@@ -246,8 +262,8 @@ requester                                candidate servers
   `NOK` discards it.
 - Our serve rate is breaker-limited: once `SERVE_RATE_LIMIT` (10) serves
   are *granted* inside `SERVE_RATE_WINDOW` (30s) we stop answering REQs
-  for `SERVE_RATE_MUTE` (60s). Only winning the ACK race counts — a NOK'd
-  ACK never cost real work, and grants arriving while muted complete
+  for `SERVE_RATE_MUTE` (60s). Only winning the ACK race counts — an
+  ungranted ACK never cost real work, and grants arriving while muted complete
   their serve without extending it. This is a silent bow-out, not a
   message — the requester's own timeout and subject-cooldown *are* the
   backpressure signal, so no wire traffic is spent reporting saturation.

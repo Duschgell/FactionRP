@@ -4,7 +4,7 @@
 -- once, server -> requester, after a granted request. The only multi-target
 -- traffic is single-chunk FRP1 control messages (subject "_frp"):
 --
---   requester: REQ <guid> -> first ACKer gets OK, late ACKers get NOK
+--   requester: REQ <guid> -> first ACKer gets OK, the rest time out
 --   server:    REQ -> ACK (if it can extract the profile) -> on OK, the
 --              data envelope goes direct to the requester
 --
@@ -72,9 +72,16 @@ function Broadcast:init()
 	--   recentReqs[guid] = last request time (per-subject cooldown)
 	--   pendingServes[key] = { subject, unitID, medium, target, at }
 	--     where key = "<peer>:<guid>" — grants we may serve.
+	-- Global fanout pacing: sightings arrive in bursts but the mesh hears at
+	-- most one request per REQ_ISSUE_INTERVAL. Deferred subjects wait in a
+	-- dedup'd FIFO and are re-validated when released.
 	self.requests = {}
 	self.recentReqs = {}
 	self.pendingServes = {}
+	self.reqBacklog = {} -- [guid] = true (membership, for dedup)
+	self.reqBacklogOrder = { head = 1, tail = 0 } -- FIFO of { guid, unitID }
+	self.lastFanoutAt = 0 -- GetTime() of the last issued fanout
+	self.fanoutInFlight = {} -- queue tail positions of issued fanouts/probes
 	self.relayProbeAt = 0 -- last whisper probe burst
 	self.probeCursor = 0 -- rotating index into the flattened probe rosters
 
@@ -102,6 +109,7 @@ function Broadcast:start()
 	end)
 	C_Timer.NewTicker(C.INJECT_INTERVAL, function()
 		self:drainInject()
+		self:drainRequests()
 	end)
 	-- One ticker drives the BNet + whisper probe rotations and the sweeps.
 	C_Timer.NewTicker(C.BNET_PROBE_INTERVAL, function()
@@ -176,9 +184,9 @@ function Broadcast:relayIgnored(key, now)
 	return p ~= nil and p.ign ~= 0 and (now - p.ign) < C.RELAY_IGNORE_TTL
 end
 
---- Next probe target via rotating cursor over both rosters, allowing
---- new targets to be probed in sequence and not get stuck trying to probe
---- the same people until ignored.
+--- Next probe target via rotating cursor over both rosters: one probe per
+--- target, and an unanswered one past RELAY_PROBE_COOLDOWN ignores the
+--- target instead of re-probing. Confirmed relays are never probed.
 function Broadcast:whisperProbeTarget(now)
 	local guildRoster = Util.xfacGuildMembers()
 	local commRoster = Util.xfacClubMembers()
@@ -196,17 +204,29 @@ function Broadcast:whisperProbeTarget(now)
 			if p and p.ign ~= 0 and (now - p.ign) >= C.RELAY_IGNORE_TTL then
 				p.ign, p.pr = 0, 0 -- served their time: fresh slate
 			end
-			if not (p and p.ign ~= 0) then
-				local fresh = p and p.conf ~= 0
+			if p and p.ign == 0 then
+				local fresh = p.conf ~= 0
 					and (now - p.conf) < C.RELAY_CONFIRM_TTL
-				local due = not p or p.lp == 0
-					or (now - p.lp) >= C.RELAY_PROBE_COOLDOWN
-				if due and (not fresh
-					or (now - p.conf) >= C.RELAY_CONFIRM_TTL * 0.5)
-				then
-					self.probeCursor = idx
-					return key, name
+				if not fresh then
+					if p.pr >= C.RELAY_PROBE_MAX then
+						-- Was quiet too long; get ignored.
+						if (now - p.lp) >= C.RELAY_PROBE_COOLDOWN then
+							p.ign = now
+							if ns.debugPeer then
+								ns.debugPeer("whisper " .. name
+									.. " ignored (unanswered probe)")
+							end
+						end
+					elseif p.lp == 0
+						or (now - p.lp) >= C.RELAY_PROBE_COOLDOWN
+					then
+						self.probeCursor = idx
+						return key, name
+					end
 				end
+			elseif not p then
+				self.probeCursor = idx
+				return key, name
 			end
 		end
 	end
@@ -447,24 +467,34 @@ function Broadcast:tick()
 	local now = GetTime()
 	local comms = ns.comms
 
-	-- Probe the next unconfirmed, non-ignored online BNet account.
-	local id = comms:probeTarget(now)
-	if id and comms:sendChunksBNet(self:ctlHello(), id) then
-		comms:markProbed(id, now)
-		if ns.statsLeg then
-			ns.statsLeg("bnet_probe", 1)
-		end
-		if ns.debugPeer then
-			ns.debugPeer("probe -> bnet " .. id)
+	-- Probe the next unconfirmed, non-ignored online BNet account. Probes are
+	-- initiated traffic like REQ fanouts and share their in-flight budget:
+	-- none go out while the queue already holds the cap.
+	if self:fanoutsInFlight() < C.FANOUT_INFLIGHT_MAX then
+		local id = comms:probeTarget(now)
+		if id and comms:sendChunksBNet(self:ctlHello(), id) then
+			comms:markProbed(id, now)
+			self.fanoutInFlight[#self.fanoutInFlight + 1] = comms.queue.tail
+			if ns.statsLeg then
+				ns.statsLeg("bnet_probe", 1)
+			end
+			if ns.debugPeer then
+				ns.debugPeer("probe -> bnet " .. id)
+			end
 		end
 	end
 
 	-- Whisper relay probing in bursts: up to RELAY_PROBE_BURST candidates per
-	-- RELAY_PROBE_INTERVAL — unconfirmed roster members first (or refresh a
-	-- stale confirmed relay). Same lifecycle as BNet.
+	-- RELAY_PROBE_INTERVAL. The rotation only returns unconfirmed candidates
+	-- with their one probe still unspent and spent-and-silent targets are
+	-- kicked to the ignore list inside whisperProbeTarget itself. Each probe
+	-- consumes an in-flight slot, so a saturated queue ends the burst early.
 	if (now - self.relayProbeAt) >= C.RELAY_PROBE_INTERVAL then
 		self.relayProbeAt = now
 		for _ = 1, C.RELAY_PROBE_BURST do
+			if self:fanoutsInFlight() >= C.FANOUT_INFLIGHT_MAX then
+				break
+			end
 			local wkey, wname = self:whisperProbeTarget(now)
 			if not wkey then
 				break
@@ -473,17 +503,12 @@ function Broadcast:tick()
 			if comms:sendChunksAddon(self:ctlHello(), "WHISPER", wname) then
 				p.lp = now
 				p.pr = p.pr + 1
+				self.fanoutInFlight[#self.fanoutInFlight + 1] = comms.queue.tail
 				if ns.statsLeg then
 					ns.statsLeg("wprobe", 1)
 				end
 				if ns.debugPeer then
 					ns.debugPeer("probe -> whisper " .. wname)
-				end
-				if p.pr >= C.RELAY_PROBE_MAX and p.ign == 0 then
-					p.ign = now
-					if ns.debugPeer then
-						ns.debugPeer("whisper " .. wname .. " ignored (" .. p.pr .. " unanswered probes)")
-					end
 				end
 			end
 		end
@@ -515,7 +540,9 @@ end
 
 --- Request `guid`'s profile from the mesh (we just saw an opposite-faction
 -- player). No-op when the cache already holds a fresh copy, a request is
--- pending, or the subject is still on cooldown.
+-- pending, the subject is still on cooldown, or it already waits in the
+-- pacing backlog. A subject arriving while a fanout went out less than
+-- REQ_ISSUE_INTERVAL ago is deferred rather than spraying a second fanout.
 function Broadcast:requestProfile(guid, unitID)
 	if not guid then
 		return
@@ -524,14 +551,98 @@ function Broadcast:requestProfile(guid, unitID)
 	if ns.cache:fresh(guid) then
 		return
 	end
-	if self.requests[guid] then
-		return -- already pending
+	if self.requests[guid] or self.reqBacklog[guid] then
+		return -- already pending, or already waiting its fanout turn
 	end
 	local last = self.recentReqs[guid]
 	if last and (now - last) < C.REQ_COOLDOWN then
 		return
 	end
+	local inflight = self:fanoutsInFlight()
+	if (now - self.lastFanoutAt) < C.REQ_ISSUE_INTERVAL
+		or inflight >= C.FANOUT_INFLIGHT_MAX
+	then
+		-- Bounded FIFO, the oldest waits are the least useful on overflow.
+		local o = self.reqBacklogOrder
+		while (o.tail - o.head + 1) >= C.REQ_BACKLOG_CAP do
+			local old = o[o.head]
+			o[o.head] = nil
+			o.head = o.head + 1
+			self.reqBacklog[old.guid] = nil
+		end
+		o.tail = o.tail + 1
+		o[o.tail] = { guid = guid, unitID = unitID }
+		self.reqBacklog[guid] = true
+		if ns.debugPeer then
+			ns.debugPeer("req " .. guid .. " deferred (fanout pacing, "
+				.. inflight .. " in flight)")
+		end
+		return
+	end
+	self:issueRequest(guid, unitID, now)
+end
 
+--- Fanouts whose chunks have not fully left the send queue. A fanout's
+--- chunks enqueue contiguously, so the queue tail position recorded at
+--- issue is "in flight" while the queue head has not passed it. Markers
+--- are pruned in place; an empty queue clears all markers outright.
+function Broadcast:fanoutsInFlight()
+	local q = ns.comms.queue
+	if q.tail < q.head then
+		for i = #self.fanoutInFlight, 1, -1 do
+			self.fanoutInFlight[i] = nil
+		end
+		return 0
+	end
+	local w = 0
+	for i = 1, #self.fanoutInFlight do
+		local pos = self.fanoutInFlight[i]
+		if pos <= q.tail and pos >= q.head then
+			w = w + 1
+			self.fanoutInFlight[w] = pos
+		end
+	end
+	for i = #self.fanoutInFlight, w + 1, -1 do
+		self.fanoutInFlight[i] = nil
+	end
+	return w
+end
+
+--- Release one deferred subject once REQ_ISSUE_INTERVAL has elapsed since
+--- the last fanout and fewer than FANOUT_INFLIGHT_MAX initiated sends still
+--- occupy the send queue.
+function Broadcast:drainRequests()
+	local o = self.reqBacklogOrder
+	if o.head > o.tail then
+		return
+	end
+	local now = GetTime()
+	if (now - self.lastFanoutAt) < C.REQ_ISSUE_INTERVAL
+		or self:fanoutsInFlight() >= C.FANOUT_INFLIGHT_MAX
+	then
+		return
+	end
+	while o.head <= o.tail do
+		local entry = o[o.head]
+		o[o.head] = nil
+		o.head = o.head + 1
+		self.reqBacklog[entry.guid] = nil
+		local last = self.recentReqs[entry.guid]
+		if not self.requests[entry.guid]
+			and not ns.cache:fresh(entry.guid)
+			and not (last and (now - last) < C.REQ_COOLDOWN)
+		then
+			self:issueRequest(entry.guid, entry.unitID, now)
+			break
+		end
+	end
+	if o.head > o.tail then
+		o.head, o.tail = 1, 0
+	end
+end
+
+--- Issue the actual REQ fanout for `guid`.
+function Broadcast:issueRequest(guid, unitID, now)
 	-- Bound outstanding requests; the oldest pending is the least useful.
 	local n = 0
 	local oldest, oldestAt
@@ -555,8 +666,12 @@ function Broadcast:requestProfile(guid, unitID)
 	end
 
 	local sent = self:sendCtlFanout(self:buildCtl("REQ", arg))
+	if sent > 0 then
+		self.fanoutInFlight[#self.fanoutInFlight + 1] = ns.comms.queue.tail
+	end
 	self.requests[guid] = { state = "open", at = now, unitID = unitID }
 	self.recentReqs[guid] = now
+	self.lastFanoutAt = now
 	if ns.statsLeg then
 		ns.statsLeg("req", 1)
 	end
@@ -807,15 +922,9 @@ function Broadcast:onControl(msg, context)
 			if peer then
 				peer("ack " .. arg .. " <- " .. tostring(target) .. " (granted)")
 			end
-		else
-			-- No pending request (or already granted): stand the server down.
-			self:sendToPeer(self:buildCtl("NOK", arg), context.medium, target)
-			if leg then
-				leg("nok", 1)
-			end
-			if peer and req then
-				peer("ack " .. arg .. " <- " .. tostring(target) .. " (denied)")
-			end
+		elseif peer and req then
+			-- Denied ACKs get no reply.
+			peer("ack " .. arg .. " <- " .. tostring(target) .. " (denied)")
 		end
 	elseif verb == "OK" then
 		local key = serveKey(context, arg)
