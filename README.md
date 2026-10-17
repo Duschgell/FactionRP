@@ -172,9 +172,9 @@ the moment someone logs in with a newer build.
 When such an announcement is received, the advertised version is compared
 against our own (the installed build's version, read from the `.toc` via
 `C_AddOns.GetAddOnMetadata`, not the `C.VERSION` constant); if it is newer,
-an update notice is printed in
-chat. Notices are deduped by the highest version already announced that
-session, so a wave of peers logging in cannot spam the chat — and since
+an update notice is printed in chat. Notices are deduped by the highest
+version already announced that session, so a wave of peers logging in
+cannot spam the chat — and since
 faction-mates log in with updated builds eventually, you get told to update
 sooner or later, right when it happens.
 
