@@ -1011,10 +1011,7 @@ function Broadcast:onControl(msg, context)
 					or Util.versionCompare(arg, self.notifiedVersion) > 0)
 			then
 				self.notifiedVersion = arg
-				ns.Print(("|cffffd200outdated:|r you are running FactionRP %s"
-					.. " but a faction-mate just announced version %s —"
-					.. " please update! (check your addon feed for the new build)")
-					:format(own, arg))
+				ns.Print(("|cffffd200outdated:|r A new version of FactionRP is available. Please update to %s. (Yours: %s)"):format(arg, own))
 				if peer then
 					peer("update notice for " .. arg)
 				end
