@@ -142,9 +142,11 @@ C.SERVE_RATE_MUTE = 60
 -- Version announcement (issue #19) -----------------------------------------
 --
 -- Once per session, shortly after login, we broadcast our addon version
--- ("VER <version>") on the same-faction comm channel. Receivers compare it
--- against their own C.VERSION and print an update notice when it is newer.
--- The announcement is retried while the channel join is still pending.
+-- ("VER <version>") on the same-faction comm channel, read from the .toc
+-- via C_AddOns.GetAddOnMetadata (see Broadcast.lua's ownVersion) rather
+-- than C.VERSION. Receivers compare it against their own addon version and
+-- print an update notice when it is newer. The announcement is retried
+-- while the channel join is still pending.
 C.VER_BROADCAST_DELAY = 15  -- seconds after login before the first attempt
 C.VER_BROADCAST_RETRY = 30  -- gap between retries (channel join pending)
 C.VER_BROADCAST_ATTEMPTS = 3 -- total attempts before giving up

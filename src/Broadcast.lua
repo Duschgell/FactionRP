@@ -476,11 +476,22 @@ end
 
 -- Version announcement (issue #19) -------------------------------------------
 
+--- Our own addon version as declared by the installed build's .toc
+--- ("## Version:"), read live from the client. The version broadcast and
+--- the update-notice comparison use this instead of C.VERSION so the check
+--- reflects what is actually installed, even when the hard-coded constant
+--- lags behind; C.VERSION is only a last-resort guard for a missing
+--- metadata field.
+local function ownVersion()
+	return C_AddOns.GetAddOnMetadata(C.ADDON_NAME, "Version") or C.VERSION
+end
+
 --- One-time broadcast of our addon version on the same-faction comm channel:
---- every FactionRP listener compares it against its own C.VERSION and tells
---- its user when it is outdated. Retried while the channel join is still
---- pending; gives up after C.VER_BROADCAST_ATTEMPTS.
+--- every FactionRP listener compares it against its own addon version and
+--- tells its user when it is outdated. Retried while the channel join is
+--- still pending; gives up after C.VER_BROADCAST_ATTEMPTS.
 function Broadcast:broadcastVersion()
+	local version = ownVersion()
 	local comms = ns.comms
 	local idx = comms and comms:channelIndex()
 	if not idx then
@@ -495,12 +506,12 @@ function Broadcast:broadcastVersion()
 		end
 		return
 	end
-	if comms:sendChunksAddon(self:buildCtl("VER", C.VERSION), "CHANNEL", idx) then
+	if comms:sendChunksAddon(self:buildCtl("VER", version), "CHANNEL", idx) then
 		if ns.statsLeg then
 			ns.statsLeg("ver", 1)
 		end
 		if ns.debugPeer then
-			ns.debugPeer("ver " .. C.VERSION .. " -> channel")
+			ns.debugPeer("ver " .. version .. " -> channel")
 		end
 	end
 end
@@ -994,7 +1005,8 @@ function Broadcast:onControl(msg, context)
 			or Util.versionCompare(arg, self.topPeerVersion) > 0
 		then
 			self.topPeerVersion = arg
-			if Util.versionCompare(arg, C.VERSION) > 0
+			local own = ownVersion()
+			if Util.versionCompare(arg, own) > 0
 				and (not self.notifiedVersion
 					or Util.versionCompare(arg, self.notifiedVersion) > 0)
 			then
@@ -1002,7 +1014,7 @@ function Broadcast:onControl(msg, context)
 				ns.Print(("|cffffd200outdated:|r you are running FactionRP %s"
 					.. " but a faction-mate just announced version %s —"
 					.. " please update! (check your addon feed for the new build)")
-					:format(C.VERSION, arg))
+					:format(own, arg))
 				if peer then
 					peer("update notice for " .. arg)
 				end

@@ -201,7 +201,8 @@ request never whispers strangers.
 ### Version announcement (`VER <addonVer>`)
 
 Once per session, shortly after login, every client broadcasts its addon
-version — a single `VER <C.VERSION>` control chunk on the same-faction comm
+version — a single `VER <addonVer>` control chunk (addonVer read from the
+.toc's `## Version:` via `C_AddOns.GetAddOnMetadata`) on the same-faction comm
 channel only (no BNet/whisper legs; faction-mates logging in with an updated
 build keep the channel covered anyway). A receiver that hears a newer version
 than its own prints a chat notice that it is outdated. Notices are deduped by
