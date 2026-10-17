@@ -12,7 +12,7 @@ ns.Const = C
 -- Identity -----------------------------------------------------------------
 
 C.ADDON_NAME = "FactionRP"
-C.VERSION = "0.3.0"
+C.VERSION = "0.3.3"
 
 -- Wire-protocol generation. Stamped into every envelope and the comm-channel
 -- name; peers advertising a lower PROTO_MAJOR are rejected outright, so each
@@ -138,6 +138,18 @@ C.SERVE_TIMEOUT = 30     -- pending serve expires without an OK
 C.SERVE_RATE_WINDOW = 30
 C.SERVE_RATE_LIMIT = 10
 C.SERVE_RATE_MUTE = 60
+
+-- Version announcement (issue #19) -----------------------------------------
+--
+-- Once per session, shortly after login, we broadcast our addon version
+-- ("VER <version>") on the same-faction comm channel, read from the .toc
+-- via C_AddOns.GetAddOnMetadata (see Broadcast.lua's ownVersion) rather
+-- than C.VERSION. Receivers compare it against their own addon version and
+-- print an update notice when it is newer. The announcement is retried
+-- while the channel join is still pending.
+C.VER_BROADCAST_DELAY = 15  -- seconds after login before the first attempt
+C.VER_BROADCAST_RETRY = 30  -- gap between retries (channel join pending)
+C.VER_BROADCAST_ATTEMPTS = 3 -- total attempts before giving up
 
 -- Caching -------------------------------------------------------------------
 

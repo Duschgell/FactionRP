@@ -1,5 +1,14 @@
 ﻿# FactionRP Changelog
 
+## 0.3.3
+
+### Added
+- One-time version broadcast on login (issue #19): shortly after entering the
+  world a single `VER <version>` control message is announced on the comm
+  channel. Peers that hear a newer version than their own print an update
+  notice in chat (deduped per session by the highest version announced).
+  `/frp status` now shows the newest version announced by a peer.
+
 ## 0.3.2
 
 ### Fixes

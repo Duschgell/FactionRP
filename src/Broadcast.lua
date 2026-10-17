@@ -91,6 +91,13 @@ function Broadcast:init()
 	self.serveWindowAt = 0
 	self.serveCount = 0
 	self.serveMuteUntil = 0
+
+	-- Version announcement (issue #19): newest peer version heard this session
+	-- (VER broadcasts on the comm channel) and the version we last printed an
+	-- update notice for (dedup — several older peers logging in must not spam).
+	self.topPeerVersion = nil
+	self.notifiedVersion = nil
+	self.verAttempts = 0
 end
 
 --- Own GUID, fetched fresh and validated on every use. A nil result
@@ -114,6 +121,13 @@ function Broadcast:start()
 	-- One ticker drives the BNet + whisper probe rotations and the sweeps.
 	C_Timer.NewTicker(C.BNET_PROBE_INTERVAL, function()
 		self:tick()
+	end)
+
+	-- Issue #19: announce our addon version once per session so out-of-date
+	-- peers on the comm channel hear it. Delayed past login because the
+	-- channel join completes asynchronously; retried while it pends.
+	C_Timer.After(C.VER_BROADCAST_DELAY, function()
+		self:broadcastVersion()
 	end)
 end
 
@@ -458,6 +472,48 @@ function Broadcast:sendToPeer(chunks, medium, target)
 		return ns.comms:sendChunksBNet(chunks, target)
 	end
 	return ns.comms:sendChunksAddon(chunks, "WHISPER", target)
+end
+
+-- Version announcement (issue #19) -------------------------------------------
+
+--- Our own addon version as declared by the installed build's .toc
+--- ("## Version:"), read live from the client. The version broadcast and
+--- the update-notice comparison use this instead of C.VERSION so the check
+--- reflects what is actually installed, even when the hard-coded constant
+--- lags behind; C.VERSION is only a last-resort guard for a missing
+--- metadata field.
+local function ownVersion()
+	return C_AddOns.GetAddOnMetadata(C.ADDON_NAME, "Version") or C.VERSION
+end
+
+--- One-time broadcast of our addon version on the same-faction comm channel:
+--- every FactionRP listener compares it against its own addon version and
+--- tells its user when it is outdated. Retried while the channel join is
+--- still pending; gives up after C.VER_BROADCAST_ATTEMPTS.
+function Broadcast:broadcastVersion()
+	local version = ownVersion()
+	local comms = ns.comms
+	local idx = comms and comms:channelIndex()
+	if not idx then
+		self.verAttempts = self.verAttempts + 1
+		if self.verAttempts < C.VER_BROADCAST_ATTEMPTS then
+			C_Timer.After(C.VER_BROADCAST_RETRY, function()
+				self:broadcastVersion()
+			end)
+		end
+		if ns.debugPeer then
+			ns.debugPeer("ver broadcast deferred (channel join pending)")
+		end
+		return
+	end
+	if comms:sendChunksAddon(self:buildCtl("VER", version), "CHANNEL", idx) then
+		if ns.statsLeg then
+			ns.statsLeg("ver", 1)
+		end
+		if ns.debugPeer then
+			ns.debugPeer("ver " .. version .. " -> channel")
+		end
+	end
 end
 
 -- Pull exchange --------------------------------------------------------------
@@ -940,6 +996,27 @@ function Broadcast:onControl(msg, context)
 		end
 	elseif verb == "NOK" then
 		self.pendingServes[serveKey(context, arg)] = nil
+	elseif verb == "VER" then
+		-- Issue #19: a same-faction peer announcing its addon version on
+		-- login. When it is newer than ours, print a one-shot update notice,
+		-- deduped by the highest version we have already been told this
+		-- session so a wave of older peers logging in cannot spam the chat.
+		if not self.topPeerVersion
+			or Util.versionCompare(arg, self.topPeerVersion) > 0
+		then
+			self.topPeerVersion = arg
+			local own = ownVersion()
+			if Util.versionCompare(arg, own) > 0
+				and (not self.notifiedVersion
+					or Util.versionCompare(arg, self.notifiedVersion) > 0)
+			then
+				self.notifiedVersion = arg
+				ns.Print(("|cffffd200outdated:|r A new version of FactionRP is available. Please update to %s. (Yours: %s)"):format(arg, own))
+				if peer then
+					peer("update notice for " .. arg)
+				end
+			end
+		end
 	end
 end
 

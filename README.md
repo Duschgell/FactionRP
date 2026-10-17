@@ -160,6 +160,28 @@ handshake confirms peers session-locally:
 Whisper relays need no handshake: `REQ` messages to unconfirmed
 cross-faction club members double as discovery — a reply proves the AddOn.
 
+### Version announcements
+
+Because there is otherwise no way to learn that your FactionRP is outdated
+except checking Curse, every client announces its addon version once per
+session: shortly after logging in it broadcasts a single version message on
+our hidden comm channel (see "Request fanout"). Since that channel is
+faction-scoped, every faction-mate running FactionRP hears the announcement
+the moment someone logs in with a newer build.
+
+When such an announcement is received, the advertised version is compared
+against our own (the installed build's version, read from the `.toc` via
+`C_AddOns.GetAddOnMetadata`, not the `C.VERSION` constant); if it is newer,
+an update notice is printed in chat. Notices are deduped by the highest
+version already announced that session, so a wave of peers logging in
+cannot spam the chat — and since
+faction-mates log in with updated builds eventually, you get told to update
+sooner or later, right when it happens.
+
+The announcement is sent once, carries no profile data, and no reply is ever
+sent: it only carries awareness, not requests. `/frp status` shows the newest
+version announced by any peer this session.
+
 ### Request fanout
 There is no data broadcast: only single-chunk control messages fan out, and
 profile data moves once per exchange. A pull's *subject* is always
