@@ -688,6 +688,36 @@ function Util.fixChompChannelTargets(channelInx)
 	end
 end
 
+--- Compare two dot-separated version strings numerically ("0.3.2", "1.0",
+-- "2"). Non-numeric suffixes are ignored, so "0.3.2-beta" compares as "0.3.2";
+-- short versions pad with zeros ("1.0" == "1.0.0").
+-- @param a string First version.
+-- @param b string Second version.
+-- @return number -1 when a < b, 1 when a > b, 0 when equal.
+function Util.versionCompare(a, b)
+	if a == b then
+		return 0
+	end
+	local av, bv = {}, {}
+	for part in a:gmatch("%d+") do
+		av[#av + 1] = part
+	end
+	for part in b:gmatch("%d+") do
+		bv[#bv + 1] = part
+	end
+	local n = math.max(#av, #bv)
+	for i = 1, n do
+		local x = tonumber(av[i]) or 0
+		local y = tonumber(bv[i]) or 0
+		if x < y then
+			return -1
+		elseif x > y then
+			return 1
+		end
+	end
+	return 0
+end
+
 --- False (+ index of the offender) if any supplied value is secret or
 --- inaccessible. A table result only certifies that it can be indexed.
 --- Fields could still be secret which is what we have Util.fieldsUsable() for.

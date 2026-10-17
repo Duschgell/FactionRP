@@ -131,6 +131,7 @@ decode `data` as a profile, and drop it harmlessly.
 |---------|---------------------|---------------------------------------------|
 | `HELLO` | addonVer            | BNet probe — "I run FactionRP"              |
 | `HI`    | addonVer            | handshake reply                             |
+| `VER`   | addonVer            | one-time version broadcast on login (see below) |
 | `REQ`   | subjectGuid [unitID]| pull request — "who can serve this profile?"|
 | `ACK`   | subjectGuid         | "I can serve it"                            |
 | `OK`    | subjectGuid         | grant — "you may send it"                   |
@@ -196,6 +197,18 @@ lifecycle as BNet accounts:
 `REQ` whisper legs reach only proven targets — confirmed relays and known
 xfac contacts; the unconfirmed roster is the probe rotation's job, so a
 request never whispers strangers.
+
+### Version announcement (`VER <addonVer>`)
+
+Once per session, shortly after login, every client broadcasts its addon
+version — a single `VER <C.VERSION>` control chunk on the same-faction comm
+channel only (no BNet/whisper legs; faction-mates logging in with an updated
+build keep the channel covered anyway). A receiver that hears a newer version
+than its own prints a chat notice that it is outdated. Notices are deduped by
+the highest version already announced that session, so a wave of peers
+logging in cannot spam the chat; `/frp status` shows the newest version
+announced by any peer. No reply is ever sent — discovery/backpressure is not
+the goal, awareness is.
 
 ## The pull exchange
 

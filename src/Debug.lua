@@ -299,7 +299,7 @@ ns.RegisterCommand("status", function()
 			end
 		end
 	end
-	ns.Print(("version %s | cache: %d | pending: %d | send queue: %d | relays: %d | contacts: %d | RP adapter: %s | debug: %s"):format(
+	ns.Print(("version %s | cache: %d | pending: %d | send queue: %d | relays: %d | contacts: %d | RP adapter: %s | debug: %s | latest announced peer version: %s"):format(
 		C.VERSION,
 		ns.cache and ns.cache:count() or 0,
 		ns.scanner and #ns.scanner.receivedQueue or 0,
@@ -307,6 +307,7 @@ ns.RegisterCommand("status", function()
 		relays,
 		contacts,
 		adapter and adapter.name or "|cffff5555none|r",
-		#enabledCats > 0 and table.concat(enabledCats, ",") or "off"
+		#enabledCats > 0 and table.concat(enabledCats, ",") or "off",
+		ns.broadcast and ns.broadcast.topPeerVersion or "none"
 	))
 end, "Show version, cache size, pending sends, adapter and debug state")
