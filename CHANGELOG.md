@@ -1,5 +1,17 @@
 ﻿# FactionRP Changelog
 
+## 0.3.4
+
+### Fixes
+- Entering a follower dungeon no longer kills profile requests with
+  `attempt to concatenate local 'realm' (a nil value)` (issue #26). A client
+  mid-transition can report no realm at all, and the secrecy check cannot
+  tell "absent" from "accessible": units whose realm cannot be read are now
+  skipped instead of raising, and control envelopes stamp an empty `unitID`
+  field while our own realm is unknown — the wire's documented "not
+  asserted" form — so requests keep flowing until the realm is readable
+  again.
+
 ## 0.3.3
 
 ### Added
