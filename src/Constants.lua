@@ -12,7 +12,7 @@ ns.Const = C
 -- Identity -----------------------------------------------------------------
 
 C.ADDON_NAME = "FactionRP"
-C.VERSION = "0.3.3"
+C.VERSION = "0.3.4"
 
 -- Wire-protocol generation. Stamped into every envelope and the comm-channel
 -- name; peers advertising a lower PROTO_MAJOR are rejected outright, so each

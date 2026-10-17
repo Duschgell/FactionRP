@@ -86,7 +86,12 @@ local SEP_LEN = #C.SEPARATOR
 -- @return string
 function Serializer.buildMessage(msg)
 	local sep = C.SEPARATOR
-	return msg.sender .. sep .. msg.subject .. sep .. msg.unitID .. sep
+	-- The unitID field is optional on the wire: parseMessage yields "" for an
+	-- absent one and Broadcast:resolveSubject documents "" as "not asserted".
+	-- Our own unitID is legitimately unknown whenever getUnitID refuses to guess
+	-- a realm it cannot see (issue #26), so encode it as absent rather than
+	-- raising on the concatenation one frame deeper.
+	return msg.sender .. sep .. msg.subject .. sep .. (msg.unitID or "") .. sep
 		.. msg.addon .. sep .. tostring(msg.originTime) .. sep
 		.. msg.contentVersion .. sep .. C.PROTO_MAJOR .. sep .. msg.data
 end

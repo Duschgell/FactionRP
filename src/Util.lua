@@ -66,6 +66,14 @@ function Util.getUnitID(unit)
 	else
 		realm = realm:gsub(REALM_STRIP, "")
 	end
+	-- Issue #26: GetNormalizedRealmName() can hand back nil while the client is
+	-- mid-transition (entering a follower dungeon), and canWeUse(nil) is true —
+	-- nil is accessible, merely absent — so the secrecy guard above cannot catch
+	-- it. Refuse an unusable realm instead of concatenating it: every caller
+	-- already treats a nil result as "unit not identified".
+	if type(realm) ~= "string" or realm == "" then
+		return nil
+	end
 	return name .. "-" .. realm
 end
 
