@@ -1,5 +1,14 @@
 ﻿# FactionRP Changelog
 
+## 0.3.5
+
+### Changed
+
+- NEW PROTOCOL VERSION!
+- Stale copies should no longer regress a fresher profile in session. NOTE: This is still very sketch and may be unreliable, but it should at least not be any worse than it was. Hopefully :)
+- REQ and ACK calls now also include additional metadata to help inform when who should serve what.
+
+
 ## 0.3.4
 
 ### Fixes
