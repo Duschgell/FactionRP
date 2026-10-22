@@ -229,9 +229,15 @@ ns.RegisterCommand("relays", function()
 	-- scanned" (0) from "scanned, none xfac" (>0 while candidates stay 0).
 	local r = ns.Util._roster and ns.Util._roster()
 	if r then
-		ns.Print(("roster membership | community: %d | guild: %d | built %ds ago"):format(
+		ns.Print(("roster membership | community: %d | guild: %d | built %s"):format(
 			mapSize(r.communityByName), mapSize(r.guildByName),
-			math.floor(GetTime() - (r.at or 0))))
+			r.at and r.at ~= 0 and (math.floor(GetTime() - r.at) .. "s ago") or "never"))
+		local st = ns.Util._rosterState and ns.Util._rosterState()
+		if st then
+			ns.Print(("roster build | building: %s | club %d/%d | parked %d | retry in %ds | suspect %d"):format(
+				tostring(st.building), st.club, st.clubs, st.parked,
+				math.floor(st.retryIn), st.suspect))
+		end
 	end
 	local lists = ns.comms and ns.comms:bnetPeerLists() or { confirmed = {}, probing = {}, ignored = {} }
 	-- Resolve BNet account ids to character names where the API allows.

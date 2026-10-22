@@ -220,6 +220,16 @@ local function mapCount(t)
 end
 
 local function finishRosterBuild(build)
+	-- Every club deferred: member data has not streamed at all yet. Keep
+	-- the old roster and retry shortly rather than publish an empty one.
+	if not build.gotAnyMembers then
+		rebuildRetryAt = GetTime() + C.ROSTER_RETRY
+		rosterBuild = nil
+		if ns.debugPeer then
+			ns.debugPeer("roster build deferred: no club member data yet")
+		end
+		return
+	end
 	-- GUIDs but no faction data means the build raced the lazy member-info
 	-- stream; keep the old roster and retry shortly.
 	if not build.sawFaction and next(build.target.guidByName) then
@@ -274,36 +284,57 @@ local function stepRosterBuild(build)
 	while budget > 0 do
 		local club = build.clubs[build.c]
 		if not club then
-			finishRosterBuild(build)
-			return
+			-- End of the list: one revisit pass over clubs whose member
+			-- data had not streamed when first reached, then finish.
+			local pending = build.unready
+			if pending and #pending > 0 and not build.revisited then
+				build.revisited = true
+				build.unready = nil
+				build.clubs = pending
+				build.c = 1
+				club = pending[1]
+			end
+			if not club then
+				finishRosterBuild(build)
+				return
+			end
 		end
 		if not build.members then
-			-- Members stream in lazily per club; defer when not ready.
+			-- Members stream in lazily per club; park an unready or secret
+			-- club for the end-of-build revisit instead of scrapping the
+			-- whole build — one laggy club must not veto the rest. A club
+			-- still unready on the revisit is skipped until the next build.
+			-- The empty member list completes the advance through the
+			-- normal member-nil transition below.
 			local okReady, ready = pcall(C_Club.AreMembersReady, club.id)
-			if okReady and not ready then
-				rebuildRetryAt = GetTime() + C.ROSTER_RETRY
-				rosterBuild = nil
-				if ns.debugPeer then
-					ns.debugPeer("roster build deferred: members not ready (club "
-						.. tostring(club.id) .. ")")
-				end
-				return
+			local ok, members
+			if okReady and ready then
+				ok, members = pcall(C_Club.GetClubMembers, club.id)
 			end
-			local ok, members = pcall(C_Club.GetClubMembers, club.id)
-			if ok and not Util.canWeUse(members) then
-				rebuildRetryAt = GetTime() + C.ROSTER_RETRY
-				rosterBuild = nil
+			if okReady and ready and ok and type(members) == "table"
+					and Util.canWeUse(members) then
+				build.members = members
+				build.gotAnyMembers = true
+				build.m = 1
 				if ns.debugPeer then
-					ns.debugPeer("roster build aborted: secret members (club "
-						.. tostring(club.id) .. ")")
+					ns.debugPeer("roster club " .. tostring(club.id) .. " -> "
+						.. #build.members .. " members")
 				end
-				return
-			end
-			build.members = (ok and type(members) == "table") and members or {}
-			build.m = 1
-			if ns.debugPeer then
-				ns.debugPeer("roster club " .. tostring(club.id) .. " -> "
-					.. #build.members .. " members")
+			else
+				if build.revisited then
+					if ns.debugPeer then
+						ns.debugPeer("roster club " .. tostring(club.id)
+							.. " skipped (members still not ready)")
+					end
+				else
+					build.unready[#build.unready + 1] = club
+					if ns.debugPeer then
+						ns.debugPeer("roster club " .. tostring(club.id)
+							.. " deferred to end (members not ready)")
+					end
+				end
+				build.members = {}
+				budget = budget - 1
 			end
 		end
 		local memberId = build.members[build.m]
@@ -369,9 +400,19 @@ local function stepRosterBuild(build)
 end
 
 -- Hoisted reschedule closure so the timer allocates nothing per slice.
+-- A slice that throws would otherwise die inside the timer callback and
+-- strand rosterBuild non-nil — every future build would NOOP forever.
 stepCurrentBuild = function()
-	if rosterBuild then
-		stepRosterBuild(rosterBuild)
+	if not rosterBuild then
+		return
+	end
+	local ok, err = pcall(stepRosterBuild, rosterBuild)
+	if not ok then
+		rosterBuild = nil
+		rebuildRetryAt = GetTime() + C.ROSTER_RETRY
+		if ns.Print then
+			ns.Print("roster build crashed: " .. tostring(err))
+		end
 	end
 end
 
@@ -438,9 +479,11 @@ local function startRosterBuild()
 	wipe(buildSeenGuild)
 	rosterBuild = {
 		clubs = list, c = 1, m = 1, members = nil, target = back,
-		deferred = {},
+		deferred = {}, unready = {},
 	}
-	stepRosterBuild(rosterBuild)
+	-- Through the crash-safe closure: a throwing first slice must not
+	-- strand rosterBuild either.
+	stepCurrentBuild()
 	return true
 end
 
@@ -452,6 +495,19 @@ local function clubRoster()
 		startRosterBuild()
 	end
 	return rosterFront
+end
+
+--- Internal build state for /frp debug. Not part of the API.
+function Util._rosterState()
+	local b = rosterBuild
+	return {
+		building = b ~= nil,
+		club = b and b.c or 0,
+		clubs = b and #b.clubs or 0,
+		parked = b and b.unready and #b.unready or 0,
+		retryIn = math.max(0, rebuildRetryAt - GetTime()),
+		suspect = suspectBuilds,
+	}
 end
 
 local lastUiRosterRefresh = 0
