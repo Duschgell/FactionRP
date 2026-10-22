@@ -1,10 +1,8 @@
 -- Comms.lua
 --
--- The transport layer. It owns the addon-message prefix, the hidden same-
--- faction chat channel, Battle.net peer enumeration, a paced outbound queue
--- (so the client throttle does not silently drop messages), and chunk
--- reassembly of inbound traffic. It deals only in opaque wire strings; the
--- message envelope is built/parsed one layer up (Broadcast + Serializer).
+-- The transport layer: addon prefix, the hidden faction channel, BNet peer
+-- enumeration, a paced outbound queue, and inbound chunk reassembly.
+-- Envelope build/parse lives one layer up (Broadcast + Serializer).
 
 local _, ns = ...
 local C = ns.Const
@@ -17,8 +15,8 @@ local bnKeys = {} -- [gameAccountID] = "bn:<id>" senderKey (persistent)
 function Comms:init()
 	self.prefix = C.MSG_PREFIX
 	self.assembler = ns.Serializer.ChunkReassembler:new()
-	-- The paced outbound queue holds *descriptors* (pooled records), not
-	-- closures: a send at steady state allocates nothing.
+	-- The queue holds pooled descriptor records, not closures, so a send at
+	-- steady state allocates nothing.
 	self.queue = { head = 1, tail = 0 }
 	self.sendCredit = 0 -- token bucket: chunks release at C.SEND_RATE/sec
 	self.descAcquire, self.descRelease = ns.Util.newPool(C.POOL_SEND_DESC)
@@ -27,15 +25,20 @@ function Comms:init()
 	-- Memoized online WoW BNet account ids (see bnetAccounts).
 	self.bnetAcctMemo = { ids = {}, at = 0 }
 	-- FRP1 BNet peer confirmation state, session-only, reset in place:
-	--   [gameAccountID] = { confirmedAt, lastProbe, probes, ignoredAt, lastHi, version }
+	--   [gameAccountID] = { confirmedAt, probeSentAt, ignoredAt, lastHi, version }
 	self.bnetPeers = {}
 	self.probeCursor = 0
-	-- [senderKey] = GetTime() expiry — chunks from senders whose messages
+	-- [senderKey] = GetTime() expiry; chunks from senders whose messages
 	-- failed the version/malformed gates are dropped before reassembly.
 	self.rejectedSenders = {}
-	-- Scratch transport contexts, mutated per inbound event. Passed to the
-	-- message handler — valid only for the duration of that synchronous call
-	-- (scratch: do not retain).
+	-- [senderKey] = GetTime() of the last accepted chunk; Broadcast uses it
+	-- to stall-detect granted serves.
+	self.lastChunkFrom = {}
+	-- Member count of the comms channel, pushed by CHANNEL_COUNT_UPDATE.
+	self.meshCount = 0
+	self.restricted = false -- edge flag: partials pruned once per restriction
+	-- Scratch transport contexts, mutated per inbound event. Valid only
+	-- for the duration of the synchronous handler call; do not retain.
 	self.chatCtx = { medium = nil, senderName = nil, senderKey = nil, gameAccountID = nil }
 	self.bnCtx = { medium = "BNET", senderName = nil, senderKey = nil, gameAccountID = nil }
 end
@@ -50,9 +53,7 @@ function Comms:start()
 	end
 	self.started = true
 
-	if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
-		C_ChatInfo.RegisterAddonMessagePrefix(self.prefix)
-	end
+	C_ChatInfo.RegisterAddonMessagePrefix(self.prefix)
 
 	ns.RegisterEvent("CHAT_MSG_ADDON", function(_, prefix, text, channel, sender)
 		self:onChatMsgAddon(prefix, text, channel, sender)
@@ -67,17 +68,36 @@ function Comms:start()
 	end)
 	self:joinChannel()
 
-	-- Friend presence churn: every event refreshes the online-account memo,
-	-- but only an actual account coming online re-opens probing — INFO_CHANGED
-	-- and FRIENDLIST_UPDATE fire on zone/status churn constantly and would
-	-- otherwise keep resurrecting ignored accounts before their TTL.
+	-- The server pushes member counts for every joined channel; ours is
+	-- the mesh size Broadcast scales the serve cooldown on.
+	ns.RegisterEvent("CHANNEL_COUNT_UPDATE", function(_, displayIndex, count)
+		if displayIndex == self:channelIndex() then
+			self.meshCount = count or 0
+		end
+	end)
+
+	-- Every presence event refreshes the account memo, but only an account
+	-- coming online re-opens probing; INFO_CHANGED/FRIENDLIST_UPDATE fire
+	-- on zone churn and would resurrect ignored accounts before their TTL.
 	local function onFriendPresence()
 		self.bnetAcctMemo.at = 0
 	end
-	local function onFriendOnline()
+	-- A friend coming online earns a fresh probe slate on just their WoW
+	-- game account — one login must not un-ignore everyone else. The event
+	-- carries friendId (a bnet account id); resolve it to the online
+	-- gameAccountID. Unresolvable lookups leave ignores alone — the TTL
+	-- decay path still applies.
+	local function onFriendOnline(_, friendId)
 		self.bnetAcctMemo.at = 0
-		for _, p in pairs(self.bnetPeers) do
+		local ok, info = pcall(C_BattleNet.GetAccountInfoByID, friendId)
+		local acct = ok and ns.Util.fieldsUsable(info, "gameAccountInfo")
+			and info.gameAccountInfo or nil
+		local gid = ns.Util.fieldsUsable(acct, "gameAccountID")
+			and acct.gameAccountID or nil
+		local p = gid and self.bnetPeers[gid]
+		if p then
 			p.ignoredAt = 0
+			p.probeSentAt = 0
 		end
 	end
 	ns.RegisterEvent("BN_FRIEND_ACCOUNT_ONLINE", onFriendOnline)
@@ -99,6 +119,12 @@ function Comms:start()
 		if dropped > 0 and ns.statsPruned then
 			ns.statsPruned(dropped)
 		end
+		local cutoff = GetTime() - C.REASSEMBLY_TIMEOUT
+		for key, at in pairs(self.lastChunkFrom) do
+			if at < cutoff then
+				self.lastChunkFrom[key] = nil
+			end
+		end
 	end)
 end
 
@@ -110,15 +136,13 @@ end
 
 -- Channel -------------------------------------------------------------------
 
---- Leave any FactionRP channel that is not our protocol generation: the
--- legacy "FactionRP" channel and "frp<N>comms" with a different N. Channel
--- membership survives /reload (it lives in the chat layer until logout), so
--- without this sweep an upgraded client keeps receiving old-protocol traffic
--- for the rest of the session.
+--- Leave any FactionRP channel that is not our protocol generation. Channel
+-- membership survives /reload, so an upgraded client would otherwise keep
+-- hearing old-protocol traffic for the session.
 function Comms:leaveForeignChannels()
 	local current = C.COMM_CHANNEL:lower()
-	-- Direct check for the legacy channel: cheap and independent of whether
-	-- hidden channels enumerate in GetChannelList.
+	-- Direct check for the legacy channel; hidden channels may not
+	-- enumerate in GetChannelList.
 	local legacyId = GetChannelName("FactionRP")
 	if legacyId and legacyId ~= 0 then
 		LeaveChannelByName("FactionRP")
@@ -138,12 +162,8 @@ function Comms:leaveForeignChannels()
 	end
 end
 
---- Join the hidden same-faction relay channel (no chat tab).
--- Joining is idempotent (client no-ops when already joined), but every join
--- still fires CHANNEL_UI_UPDATE/CHANNEL_COUNT_UPDATE toggles in the client.
--- Other add-ons listening to those events (notably TRP3's broadcast channel
--- manager, which repeatedly re-evaluates its own channel index while the list
--- churns) see extra work and can transiently resolve the wrong index.
+--- Join the hidden same-faction channel. Joining fires CHANNEL_UI_UPDATE
+-- churn in the client even when already joined, so skip when we are in.
 function Comms:joinChannel()
 	self:leaveForeignChannels()
 	if self:channelIndex() then
@@ -159,6 +179,15 @@ function Comms:channelIndex()
 		return nil
 	end
 	return id
+end
+
+--- Live member count of the comms channel: 0 while not joined, and until
+-- the first CHANNEL_COUNT_UPDATE arrives after a join.
+function Comms:meshCount()
+	if not self:channelIndex() then
+		return 0
+	end
+	return self.meshCount
 end
 
 -- Register an event so we can update our channel on reorder over the pipe.
@@ -187,15 +216,13 @@ function Comms:enqueue(desc)
 	end
 end
 
---- Interpret a queued descriptor and dispatch it through Chomp (or the raw
--- API fallback), recording the chunk/leg stats hooks. After dispatch the
--- descriptor is released back to the pool.
+--- Dispatch a queued descriptor through Chomp (or the raw fallback),
+-- recording stats hooks. The descriptor is released after dispatch.
 function Comms:sendDescriptor(desc)
 	local text = desc.text
 	if desc.kind == "CHANNEL" then
-		-- Always refresh the index at dispatch: a name-pinned leg resolves its
-		-- own channel, anything else rides the relay channel. Reorders between
-		-- enqueue and dispatch can otherwise re-point a leg at a stale index.
+		-- Resolve the index at dispatch; a reorder between enqueue and
+		-- dispatch can otherwise re-point a leg at a stale index.
 		if desc.channelName then
 			desc.target = GetChannelName(desc.channelName)
 		else
@@ -211,45 +238,45 @@ function Comms:sendDescriptor(desc)
 	if ns.debugChunk then
 		ns.debugChunk("out", desc.kind, desc.target, #text)
 	end
-	-- The final chunk of a leg carries leg-completion fields so the stats
-	-- collector can time the full message drain — no callback closure needed.
+	-- The final chunk carries leg-completion fields so stats can time the
+	-- full message drain.
 	if desc.legTotal and ns.statsOutLeg then
 		ns.statsOutLeg(desc.kind, desc.target, desc.legBytes, desc.legTotal, GetTime() - desc.legStartedAt)
 	end
 	local chomp = AddOn_Chomp
 	if desc.mode == "bnet" then
+		-- BNet sends share ChatThrottleLib's queue via Chomp when present.
 		if chomp and chomp.BNSendGameData then
 			chomp.BNSendGameData(desc.target, self.prefix, text, "LOW")
 			return
 		end
-		if BNSendGameData then
-			BNSendGameData(desc.target, self.prefix, text)
-		end
+		C_BattleNet.SendGameData(desc.target, self.prefix, text)
 		return
 	end
-	-- Routing through Chomp (shipped by TRP3, and hence by every client
-	-- running any major RP AddOn) means our bulk addon traffic is coalesced
-	-- into the same global ChatThrottleLib queues as everyone else's addon
-	-- traffic. Raw C_ChatInfo.SendAddonMessage bursts from the queue can
-	-- stall other add-ons' queued CHANNEL messages (notably TRP3's C_SCAN
-	-- map-scan requests, which are sent unthrottled at scan time and are
-	-- sensitive to chat-frame send backoff).
+	-- Chomp coalesces our sends into ChatThrottleLib's global queues. Raw
+	-- SendAddonMessage bursts can stall other addons' CHANNEL sends
+	-- (TRP3's unthrottled C_SCAN map-scan requests, notably).
 	if chomp and chomp.SendAddonMessage then
 		chomp.SendAddonMessage(self.prefix, text, desc.kind, desc.target, "LOW")
 		return
 	end
-	if C_ChatInfo and C_ChatInfo.SendAddonMessage then
-		C_ChatInfo.SendAddonMessage(self.prefix, text, desc.kind, desc.target)
-	end
+	C_ChatInfo.SendAddonMessage(self.prefix, text, desc.kind, desc.target)
 end
 
---- Release queued sends at C.SEND_RATE chunks/second. A fractional token
---- bucket keeps fractional rates smooth (7.5/s releases 1,2,1,2,... per
---- 0.2s tick); credit is capped at max(SEND_RATE, 1) -- one send's worth --
---- so an idle queue cannot bank an unbounded burst and sub-1/s rates can
---- still accumulate a send. The 1e-6 tolerance absorbs float accrual
---- (0.1*10 ~= 1.0 in binary). Invoked on a timer.
+--- Release queued sends at C.SEND_RATE chunks/second via a fractional
+-- token bucket. Credit caps at one send's worth so an idle queue cannot
+-- bank an unbounded burst; the 1e-6 tolerance absorbs float accrual.
 function Comms:flushQueue()
+	-- Hold all sends while restricted; the queue drains after. On entry,
+	-- drop partial inbound buffers: their missing chunks can never arrive.
+	if ns.Util.commsRestricted() then
+		if not self.restricted then
+			self.restricted = true
+			self.assembler:prune(0)
+		end
+		return
+	end
+	self.restricted = nil
 	-- Hold all sends while our own GUID is unreadable.
 	if not ns.Util.canWeUse(UnitGUID("player")) then
 		return
@@ -269,7 +296,7 @@ function Comms:flushQueue()
 	self.sendCredit = self.sendCredit - sent
 	q.head = head
 	if head > q.tail then
-		-- Queue drained: reset indices so the array part stays small.
+		-- Queue drained: reset indices to keep the array small.
 		q.head, q.tail = 1, 0
 	end
 end
@@ -306,11 +333,10 @@ function Comms:sendBNet(text, gameAccountID)
 end
 
 -- Convenience: send a list of chunks over a single medium ------------------
--- The final chunk's descriptor carries leg-completion fields so the stats
--- collector can time how long a full message took to drain to this leg.
+-- The final chunk's descriptor carries leg-completion fields for stats.
 
---- Whether a leg of `n` chunks fits within the queue bound. Legs drop whole:
--- a partial message is an incomplete at the far end plus wasted sibling sends.
+--- Whether a leg of `n` chunks fits the queue bound. Legs drop whole: a
+-- partial send is an incomplete at the far end plus wasted siblings.
 local function legFits(comms, n)
 	return comms:queueDepth() + n <= C.SEND_QUEUE_CAP
 end
@@ -341,8 +367,7 @@ function Comms:sendChunksAddon(chunks, kind, target)
 end
 
 --- Send a chunk list over a named custom channel (e.g. a previous-generation
--- comm channel for the version announcement). The name resolves to an index
--- at dispatch time like the relay channel does.
+-- channel for the version announcement). Resolves to an index at dispatch.
 function Comms:sendChunksChannel(chunks, channelName)
 	local n = #chunks
 	if not legFits(self, n) then
@@ -392,23 +417,27 @@ end
 
 -- Peer enumeration ----------------------------------------------------------
 
---- The addon channel kind for the current group, or nil if solo.
--- Handles instanced groups, where PARTY/RAID do not deliver.
-function Comms:groupChannel()
-	if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
-		return "INSTANCE_CHAT"
-	elseif IsInRaid() then
-		return "RAID"
-	elseif IsInGroup() then
-		return "PARTY"
+--- Whether a BNet game account's character is our own faction. A
+-- same-faction friend is reachable on the comm channel already — the BNet
+-- leg exists to bridge factions, so they are not a valid relay. Unknown
+-- or unreadable factions stay candidates.
+local function sameFactionAccount(acct)
+	local fname = acct.factionName
+	if not ns.Util.canWeUse(fname) or not fname then
+		return false
 	end
-	return nil
+	local en, loc = UnitFactionGroup("player")
+	if not ns.Util.canWeUse(en, loc) then
+		return false
+	end
+	return fname == en or fname == loc
 end
 
 --- Invoke callback(gameAccountID) for every online WoW Battle.net friend in
--- the current region. These are our cross-faction relays.
+-- the current region whose character is opposite-faction. These are our
+-- cross-faction relays.
 function Comms:eachBNetGameAccount(callback)
-	if BNFeaturesEnabledAndConnected and not BNFeaturesEnabledAndConnected() then
+	if not BNFeaturesEnabledAndConnected() then
 		return
 	end
 	local numFriends = BNGetNumFriends()
@@ -426,6 +455,7 @@ function Comms:eachBNetGameAccount(callback)
 					and acct.isOnline
 					and acct.clientProgram == BNET_CLIENT_WOW
 					and acct.isInCurrentRegion
+					and not sameFactionAccount(acct)
 				then
 					callback(acct.gameAccountID)
 				end
@@ -434,10 +464,9 @@ function Comms:eachBNetGameAccount(callback)
 	end
 end
 
---- Online WoW Battle.net game account ids, memoized for C.BNET_MEMO seconds.
--- Enumerating friends allocates client tables per account; the fanout uses
--- this memoized list instead of a full scan per message.
--- @return table List of gameAccountIDs (do not mutate — shared reference).
+--- Online WoW Battle.net game account ids, memoized for C.BNET_MEMO
+-- seconds; enumeration allocates client tables per account.
+-- @return table List of gameAccountIDs (do not mutate, shared reference).
 function Comms:bnetAccounts()
 	local memo = self.bnetAcctMemo
 	local now = GetTime()
@@ -456,22 +485,20 @@ end
 
 -- BNet peer confirmation (FRP1 handshake) -----------------------------------
 -- Lifecycle per account: unconfirmed -> probing -> ignored | confirmed.
--- Any complete, parseable FactionRP message arriving over BNet confirms the
--- account (bnetPeerSeen).
+-- Any parseable FactionRP message over BNet confirms the account.
 -- Entries are reset in place; the map is bounded by the friends list.
 
 local function peerEntry(peers, id)
 	local p = peers[id]
 	if not p then
-		p = { confirmedAt = 0, lastProbe = 0, probes = 0, ignoredAt = 0, lastHi = 0, version = nil }
+		p = { confirmedAt = 0, probeSentAt = 0, ignoredAt = 0, lastHi = 0, version = nil }
 		peers[id] = p
 	end
 	return p
 end
 
---- Stamp `id` as confirmed: it demonstrably runs FactionRP (it sent us a
--- parseable FRP message). Clears probe/ignore state and records the remote
--- addon version when supplied (control messages carry it).
+--- Stamp `id` as confirmed: it sent us a parseable FRP message. Records
+-- the remote addon version when control messages carry it.
 function Comms:bnetPeerSeen(id, version)
 	if not id then
 		return
@@ -479,7 +506,7 @@ function Comms:bnetPeerSeen(id, version)
 	local p = peerEntry(self.bnetPeers, id)
 	local was = p.confirmedAt
 	p.confirmedAt = GetTime()
-	p.probes = 0
+	p.probeSentAt = 0
 	p.ignoredAt = 0
 	if version and version ~= "" then
 		p.version = version
@@ -495,10 +522,8 @@ function Comms:isBNetConfirmed(id, now)
 	return p ~= nil and (now - p.confirmedAt) < C.BNET_CONFIRM_TTL
 end
 
---- Pick the next online account due for a HELLO probe (round-robin over the
--- memoized account list). Skips confirmed and ignored accounts; expired
--- ignores re-enter rotation. Does not stamp — the caller marks the probe
--- only if it actually queued.
+--- Pick the next online account due for a HELLO probe, round-robin over the
+-- memoized list. Does not stamp; the caller marks the probe if it queued.
 -- @return number|nil gameAccountID
 function Comms:probeTarget(now)
 	local ids = self:bnetAccounts()
@@ -517,12 +542,25 @@ function Comms:probeTarget(now)
 		then
 			-- Ignore decayed: let the account re-enter probe rotation.
 			p.ignoredAt = 0
-			p.probes = 0
+			p.probeSentAt = 0
 		end
+		if p
+			and p.probeSentAt ~= 0
+			and p.ignoredAt == 0
+			and (now - p.probeSentAt) >= C.BNET_PROBE_DEADLINE
+		then
+			-- One shot missed its window: bench the account.
+			p.ignoredAt = now
+			p.probeSentAt = 0
+			if ns.debugPeer then
+				ns.debugPeer("bnet " .. id .. " ignored (unanswered probe)")
+			end
+		end
+		local awaiting = p and p.probeSentAt ~= 0
 		local ignored = p and p.ignoredAt ~= 0
-		if not ignored
+		if not awaiting
+			and not ignored
 			and not self:isBNetConfirmed(id, now)
-			and (not p or (now - p.lastProbe) >= C.BNET_PROBE_COOLDOWN)
 		then
 			return id
 		end
@@ -530,23 +568,13 @@ function Comms:probeTarget(now)
 	return nil
 end
 
---- Record that a HELLO probe was actually queued to `id`. Past
--- BNET_PROBE_MAX unanswered probes the account is ignored until
--- BNET_IGNORE_TTL (or a friend-presence event) re-opens it.
-function Comms:markProbed(id, now)
-	local p = peerEntry(self.bnetPeers, id)
-	p.lastProbe = now
-	p.probes = p.probes + 1
-	if p.probes > C.BNET_PROBE_MAX and p.ignoredAt == 0 then
-		p.ignoredAt = now
-		if ns.debugPeer then
-			ns.debugPeer("bnet " .. id .. " ignored (" .. p.probes .. " unanswered probes)")
-		end
-	end
+--- Record that a HELLO probe was queued to `id`; the account is awaiting
+-- an answer until BNET_PROBE_DEADLINE benches it.
+function Comms:markAwaiting(id, now)
+	peerEntry(self.bnetPeers, id).probeSentAt = now
 end
 
---- Whether we may send another HI handshake reply to `id` (rate-limit so a
--- HELLO-spamming peer cannot drain our queue).
+--- Whether we may send another HI reply to `id` (rate-limit vs spam).
 function Comms:canHi(id, now)
 	local p = self.bnetPeers[id]
 	return not p or (now - p.lastHi) >= C.BNET_HI_COOLDOWN
@@ -565,7 +593,7 @@ function Comms:bnetPeerLists()
 			lists.ignored[#lists.ignored + 1] = id
 		elseif (now - p.confirmedAt) < C.BNET_CONFIRM_TTL then
 			lists.confirmed[#lists.confirmed + 1] = id
-		elseif p.lastProbe ~= 0 then
+		elseif p.probeSentAt ~= 0 then
 			lists.probing[#lists.probing + 1] = id
 		end
 	end
@@ -611,16 +639,9 @@ function Comms:onBNChatMsgAddon(prefix, text, bnetIDGameAccount)
 	self:handleIncoming(text, ctx)
 end
 
---- Reassemble a chunk and, once a full message is available, hand it to the
--- registered message handler with transport context (used by Broadcast for
--- loop avoidance and to avoid echoing back to the source peer).
--- NOTE: `context` is a shared scratch table which is valid only for the duration of
--- this synchronous call chain (incl. messageHandler).
---- Mark a sender as rejected: their chunks are dropped before reassembly for
--- REJECTED_SENDER_TTL seconds. Called by the message layer when a complete
--- message fails the protocol-version or malformed gates — the version lives
--- inside the envelope, so chunk-level filtering is impossible without this
--- marker. Wire accounting (statsChunkIn) still counts their traffic.
+--- Drop `senderKey`'s chunks before reassembly for REJECTED_SENDER_TTL.
+-- The protocol version lives inside the envelope, so version-rejected
+-- senders need this marker to stop their chunk stream early.
 function Comms:blockSender(senderKey)
 	if self.rejectedSenders[senderKey] then
 		return
@@ -631,7 +652,21 @@ function Comms:blockSender(senderKey)
 	end
 end
 
+--- Reassemble a chunk; hand full messages to the message handler with
+-- `context` (a shared scratch table, valid only for this call chain).
+--- The reassembly senderKey for a (medium, target) pair: BNet accounts
+-- key as "bn:<id>", chat media key by raw sender name.
+function Comms:senderKeyFor(medium, target)
+	if medium == "BNET" then
+		return "bn:" .. tostring(target)
+	end
+	return target
+end
+
 function Comms:handleIncoming(chunkString, context)
+	if ns.Util.commsRestricted() then
+		return -- inbound chunks are dropped outright while restricted
+	end
 	-- Reassembly is keyed by a stable per-sender identity.
 	local senderKey = context.senderKey
 	if ns.statsChunkIn then
@@ -643,6 +678,9 @@ function Comms:handleIncoming(chunkString, context)
 			return -- old-protocol/garbage stream: never reassembled
 		end
 		self.rejectedSenders[senderKey] = nil -- block decayed
+	end
+	if senderKey then
+		self.lastChunkFrom[senderKey] = GetTime()
 	end
 	if ns.debugChunk then
 		ns.debugChunk("in", context.medium, senderKey, #chunkString)

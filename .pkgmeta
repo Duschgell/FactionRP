@@ -5,5 +5,7 @@ manual-changelog:
     markup-type: markdown
 
 ignore:
-    - /README.md
-    - /LICENSE
+    - README.md
+    - doc/
+    - .gitignore
+    - tools/
