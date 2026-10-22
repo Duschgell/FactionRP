@@ -1,5 +1,9 @@
 ﻿# FactionRP Changelog
 
+## 0.4.2
+
+- Fixed `meshCount` shadowing issue.
+
 ## 0.4.1
 
 ### Fixes

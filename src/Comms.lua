@@ -35,7 +35,7 @@ function Comms:init()
 	-- to stall-detect granted serves.
 	self.lastChunkFrom = {}
 	-- Member count of the comms channel, pushed by CHANNEL_COUNT_UPDATE.
-	self.meshCount = 0
+	self.meshSize = 0
 	self.restricted = false -- edge flag: partials pruned once per restriction
 	-- Scratch transport contexts, mutated per inbound event. Valid only
 	-- for the duration of the synchronous handler call; do not retain.
@@ -79,7 +79,7 @@ function Comms:start()
 	-- the mesh size Broadcast scales the serve cooldown on.
 	ns.RegisterEvent("CHANNEL_COUNT_UPDATE", function(_, displayIndex, count)
 		if displayIndex == self:channelIndex() then
-			self.meshCount = count or 0
+			self.meshSize = count or 0
 		end
 	end)
 
@@ -194,7 +194,7 @@ function Comms:meshCount()
 	if not self:channelIndex() then
 		return 0
 	end
-	return self.meshCount
+	return self.meshSize
 end
 
 -- Register an event so we can update our channel on reorder over the pipe.
