@@ -7,7 +7,7 @@
 -- The "about" section is intentionally excluded (see README "Additional Plans").
 --
 -- The adapter-private `data` payload we produce/consume looks like:
---   { profileID = "abc123", sections = { characteristics = {...}, character = {...}, misc = {...} } }
+--   { profileID = "abc123", sections = { characteristics = {...}, character = {...}, misc = {...} }, clientInfo = {...} } <--- //edit: new field
 -- profileID is required by TRP3's register on injection (saveCurrentProfileID).
 
 local _, ns = ...
@@ -35,6 +35,14 @@ function TRP3Adapter:isAvailable()
 		and reg.saveCurrentProfileID ~= nil
 		and reg.addCharacter ~= nil
 		and reg.registerInfoTypes ~= nil
+-- //edit only be ready when all trp3 functions are ready
+		and type(reg.saveClientInformation) == "function"
+		and type(reg.getUnitIDCharacter) == "function"
+		and type(api.utils) == "table"
+		and type(api.utils.str) == "table"
+		and type(api.utils.str.sanitizeVersion) == "function"
+		and type(api.utils.str.getUnitID) == "function"
+		and type(api.globals) == "table"
 		and api.profile.isDefaultProfile ~= nil
 end
 
@@ -60,7 +68,7 @@ end
 -- profile.mspver CRC versions fold in as a sorted suffix.
 local mspFields = {} -- scratch: refilled per buildContentVersion call
 
-local function buildContentVersion(sections, mspver)
+local function buildContentVersion(sections, mspver, clientInfo)
 	local function v(section)
 		return (section and section.v) or 0
 	end
@@ -84,8 +92,31 @@ local function buildContentVersion(sections, mspver)
 			version = version .. "|msp:" .. table.concat(mspFields, ",")
 		end
 	end
+
+	if clientInfo then
+
+		local function part(value)
+
+			return (tostring(value == nil and "" or value):gsub("[|:]", "_"))
+		end
+
+		version = version .. "|ci:" .. table.concat({
+			part(clientInfo.client), 
+			part(clientInfo.clientVersion),
+			part(clientInfo.msp), 
+			part(clientInfo.extended),
+			part(clientInfo.extendedVersion), 
+			part(clientInfo.isTrial),
+			part(clientInfo.roleplayExperience), 
+			part(clientInfo.classID),
+		}, ":")
+	end
+
 	return version
+
 end
+
+
 
 -- Gather the three sections for the LOCAL player via TRP3's exchange getters.
 local function getLocalSections()
@@ -109,6 +140,79 @@ local function getRegisteredSections(unitID)
 		character = profile.character,
 		misc = profile.misc,
 	}, profile.mspver
+end
+
+-- //edit: TotalRP3 turns unknown versions into "0", we don't need to relay those
+
+local function validateTRPVersion(value)
+    if type(value) ~= "string" or value == "" then
+        return nil
+    end
+
+    local version = TRP3_API.utils.str.sanitizeVersion(value)
+
+    if type(version) ~= "string" or version == "" then
+        return nil
+    end
+
+    local numericPart = version:match("^v?([%d%.]+)")
+
+    if numericPart and numericPart:match("^[0%.]+$") then
+        return nil
+    end
+
+    return version
+end
+
+local function getClientInfo(unitID)
+
+	local reg = TRP3_API.register
+	local g = TRP3_API.globals
+	local info
+
+	if g and unitID == g.player_id then
+
+		local extended = tonumber(g.extended_version) or 0
+		local playerAPI = AddOn_TotalRP3 and AddOn_TotalRP3.Player
+		local me = playerAPI and playerAPI.GetCurrentUser and playerAPI.GetCurrentUser()
+		info = {
+			client = extended > 0 and g.addon_name_extended or g.addon_name,
+			clientVersion = validateTRPVersion(g.version_display),
+			msp = false,
+			extended = extended,
+			isTrial = g.is_trial_account,
+			extendedVersion = extended > 0 and validateTRPVersion(g.extended_display_version) or nil,
+			roleplayExperience = me and me.GetRoleplayExperience and me:GetRoleplayExperience(),
+			classID = g.player_class_index,
+		}
+
+	elseif reg.getUnitIDCharacter and reg.isUnitIDKnown(unitID) then
+
+		local c = reg.getUnitIDCharacter(unitID)
+		info = {
+			client = c.client,
+			clientVersion = validateTRPVersion(c.clientVersion),
+			msp = c.msp,
+			extended = c.extended,
+			isTrial = c.isTrial,
+			extendedVersion = (tonumber(c.extended) or 0) > 0 and validateTRPVersion(c.extendedVersion) or nil,
+			roleplayExperience = c.roleplayExperience,
+			classID = c.classID,
+		}
+	end
+
+	if not info or type(info.client) ~= "string" or info.client == ""
+		or not info.clientVersion then
+		return nil
+	end
+
+	-- //edit: TRP3 uses "casual" as fallback if there is no roleplay experience
+	if info.roleplayExperience == nil then
+		local enums = AddOn_TotalRP3 and AddOn_TotalRP3.Enums
+		local values = enums and enums.ROLEPLAY_EXPERIENCE
+		info.roleplayExperience = values and values.CASUAL
+	end
+	return info
 end
 
 --- Extract a profile for `unitID` from TRP3's own data, deep-copying so we
@@ -145,10 +249,17 @@ function TRP3Adapter:extract(unitID)
 		sections[key] = CopyTable(section)
 	end
 
+	local clientInfo = getClientInfo(unitID)
+
 	return {
 		addon = self.name,
-		contentVersion = buildContentVersion(sections, mspver),
-		data = { profileID = profileID, sections = sections },
+		contentVersion = buildContentVersion(sections, mspver, clientInfo),
+
+		data = { 
+		profileID = profileID, 
+		sections = sections, 
+		clientInfo = clientInfo 
+		},
 	}
 end
 
@@ -187,7 +298,7 @@ function TRP3Adapter:profileMeta(unitID)
 		characteristics = profile.characteristics,
 		character = profile.character,
 		misc = profile.misc,
-	}, profile.mspver)
+	}, profile.mspver, getClientInfo(unitID))
 	return { at = profile.time, pid = reg.getUnitIDProfileID(unitID), cv = cv }
 end
 
@@ -270,28 +381,108 @@ function TRP3Adapter:inject(unitID, data, classID)
 	end
 	-- Minimal client info: enough for TRP3 to treat them as a TRP3 user.
 	-- (client, clientVersion, msp, extended, isTrial, extendedVersion, rpExperience, classID)
-	reg.saveClientInformation(unitID, "Total RP 3", "", false, 0, false, "", nil, classID)
-	reg.saveCurrentProfileID(unitID, data.profileID)
 
-	-- Skip sections TRP3 already holds at the same version to avoid
-	-- redundant writes and update events.
+	-- //edit: preserving the real client informationen and the trp3 extended. Only overwrite if values/data changed
+	local info = data.clientInfo
+	local clientVersion = type(info) == "table" and validateTRPVersion(info.clientVersion)
+	local character = reg.getUnitIDCharacter(unitID)
+	local metadataChanged = false
+
+	if clientVersion and type(info.client) == "string" and info.client ~= "" then
+		local extended = tonumber(info.extended) or 0
+		local extendedVersion = extended > 0 and validateTRPVersion(info.extendedVersion) or nil
+
+		local mspEnabled = info.msp == true
+		local classToSave = classID or info.classID
+
+		--//edit: We need to avoid (over)writing on every tooltip update. So we compare the trp3 values
+		local experience = info.roleplayExperience
+
+		if experience == nil then
+			local enums = AddOn_TotalRP3 and AddOn_TotalRP3.Enums
+			local values = enums and enums.ROLEPLAY_EXPERIENCE
+			experience = values and values.CASUAL
+
+		end
+
+		metadataChanged = character.client ~= info.client
+			or character.clientVersion ~= clientVersion
+			or character.msp ~= mspEnabled
+			or character.extended ~= extended
+			or character.isTrial ~= info.isTrial
+			or character.extendedVersion ~= extendedVersion
+			or character.roleplayExperience ~= experience
+			or character.classID ~= classToSave
+
+		if metadataChanged then
+			reg.saveClientInformation(
+				unitID, info.client, clientVersion, mspEnabled,
+				extended, info.isTrial, extendedVersion,
+				experience, classToSave
+			)
+
+		end
+	else
+
+		--//edit: this is a small cleanup for the old placeholders FactionRP placed -> We clear the v0 placeholders for the trp versions
+	if character
+		and (character.client == "Total RP 3" or character.client == "TRP3: Extended") and not validateTRPVersion(character.clientVersion)
+	then
+		reg.saveClientInformation(
+			unitID,
+			nil,
+			nil,
+			character.msp,
+			nil,
+			character.isTrial,
+			nil,
+			character.roleplayExperience,
+			character.classID
+		)
+
+		metadataChanged = true
+	end
+
+	end
+
+	local oldProfileID = reg.getUnitIDProfileID(unitID)
+	local profileChanged = oldProfileID ~= data.profileID
+
+	if profileChanged or not reg.profileExists(unitID) then
+		reg.saveCurrentProfileID(unitID, data.profileID)
+	end
+
+	--//edit: Skipping unnecessary updating and writing
 	local injected = false
 	local section = data.sections.characteristics
+
 	if section and reg.shouldUpdateInformation(unitID, types.CHARACTERISTICS, section.v) then
 		reg.saveInformation(unitID, types.CHARACTERISTICS, section)
 		injected = true
 	end
+
 	section = data.sections.character
+
 	if section and reg.shouldUpdateInformation(unitID, types.CHARACTER, section.v) then
 		reg.saveInformation(unitID, types.CHARACTER, section)
 		injected = true
 	end
+
 	section = data.sections.misc
+
 	if section and reg.shouldUpdateInformation(unitID, types.MISC, section.v) then
 		reg.saveInformation(unitID, types.MISC, section)
 		injected = true
+
 	end
-	return injected
+
+	if metadataChanged and not injected and oldProfileID == data.profileID and TRP3_Addon and TRP3_Addon.Events	and TRP3_Addon.Events.REGISTER_DATA_UPDATED then
+
+		TRP3_Addon:TriggerEvent(TRP3_Addon.Events.REGISTER_DATA_UPDATED,unitID, data.profileID, "unitID")
+	end
+
+	return injected or metadataChanged or profileChanged
+
 end
 
 --- Hook TRP3's internal "register data updated" callback so the Scanner can
