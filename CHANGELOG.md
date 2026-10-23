@@ -1,5 +1,9 @@
 ﻿# FactionRP Changelog
 
+## 0.4.3
+
+- Fixed TRP3 version display
+
 ## 0.4.2
 
 - Fixed `meshCount` shadowing issue.
