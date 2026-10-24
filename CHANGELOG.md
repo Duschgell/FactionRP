@@ -2,9 +2,14 @@
 
 ## 0.4.4
 
+### Changed
+- Mouseover profile requests are now delayed by 3 seconds, indicated by a progress bar on the tooltip.
+- Attempt pull without delay when targeting.
+
 ### Fixes
 - Club roster was never built unless the Communities panel had been opened. It is now fixed.
 - FRP now has a visible delay before it requests profiles. Targeting a person will still issue a request immediately.
+- `/frp debug all` toggling was malfunctioning and didn't toggle all like expected.
 
 ## 0.4.3
 
