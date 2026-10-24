@@ -30,6 +30,9 @@ end
 
 --- If `unit` is an opposite-faction player we have cached, inject the profile.
 function Tooltip:tryInject(unit)
+	if ns.Util.commsRestricted() then
+		return -- no unit reads at all under lockdown
+	end
 	-- During combat (e.g. in dungeons) the unit token can be a "secret"
 	-- value. Passing it to UnitIsPlayer and friends during our (tainted)
 	-- execution errors, so bail out immediately.
@@ -130,7 +133,8 @@ function Tooltip:updateIndicator()
 		return
 	end
 	local status, got, total
-	local unit = select(2, GameTooltip:GetUnit())
+	local unit = not ns.Util.commsRestricted()
+		and select(2, GameTooltip:GetUnit())
 	if unit and ns.Util.canWeUse(unit) then
 		local isPlayer = UnitIsPlayer(unit)
 		if ns.Util.canWeUse(isPlayer) and isPlayer
@@ -139,6 +143,12 @@ function Tooltip:updateIndicator()
 			local guid = UnitGUID(unit)
 			if ns.Util.canWeUse(guid) and guid then
 				status, got, total = ns.broadcast:reqStatus(guid)
+				if not status and ns.scanner then
+					local frac = ns.scanner:hoverProgress(guid)
+					if frac then
+						status, got = "hover", frac
+					end
+				end
 			end
 		end
 	end
@@ -154,6 +164,10 @@ function Tooltip:updateIndicator()
 		pct = math.floor(got / total * 100 + 0.5)
 	elseif status == "miss" and got then
 		retry = got
+	elseif status == "hover" and got then
+		pct = math.floor(got * 100 + 0.5)
+		retry = math.max(1, math.ceil(
+			ns.Const.MOUSEOVER_REQ_DELAY * (1 - got)))
 	end
 	-- Width follows the tooltip; clamp for unreadable or degenerate sizes.
 	local width = GameTooltip:GetWidth()
@@ -193,6 +207,12 @@ function Tooltip:updateIndicator()
 		ind.fill:Show()
 		ind.text:SetText("No response. Try again in " .. retry .. "s")
 		ind.text:SetTextColor(0.85, 0.7, 0.7)
+	elseif status == "hover" then
+		ind.fill:SetWidth(math.max(1, (width - 2) * pct / 100))
+		ind.fill:SetVertexColor(0.5, 0.85, 0.6, 0.3)
+		ind.fill:Show()
+		ind.text:SetText("Requesting profile in " .. retry .. "s")
+		ind.text:SetTextColor(0.8, 0.95, 0.85)
 	else
 		ind.fill:Hide()
 		ind.text:SetText("Please wait...")
