@@ -1,5 +1,10 @@
 ﻿# FactionRP Changelog
 
+## 0.4.4
+
+### Fixes
+- Club roster was never built unless the Communities panel had been opened. It is now fixed.
+
 ## 0.4.3
 
 - Fixed TRP3 version display
