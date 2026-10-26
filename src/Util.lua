@@ -171,6 +171,7 @@ local function rosterTables()
 		guildByName = {},   -- normalized name -> true (guild members)
 		communityByName = {}, -- normalized name -> true (community members)
 		onlineByName = {},  -- normalized name -> true (logged-in members)
+		offlineByName = {}, --//edit: normalized name -> true (explicit offline presence)
 	}
 end
 
@@ -180,6 +181,8 @@ local rosterFront = rosterTables()
 rosterFront.at = 0
 local rosterBack = rosterTables()
 local rosterBuild = nil -- incremental build state, or nil when idle
+local rosterReady = true
+local unavailableRoster = {}
 local rebuildRetryAt = 0  -- no rebuild before this time (suspect-build retry)
 -- Per-build dedup scratch, persistent and wiped at each build start.
 local buildSeenXfac, buildSeenGuild = {}, {}
@@ -262,6 +265,7 @@ local function finishRosterBuild(build)
 	-- Publish the back buffer by swapping.
 	rosterBack.at = GetTime()
 	rosterFront, rosterBack = rosterBack, rosterFront
+	rosterReady = true
 	rosterBuild = nil
 	suspectBuilds = 0
 	if ns.debugPeer then
@@ -280,6 +284,12 @@ local function stepRosterBuild(build)
 	if build ~= rosterBuild then
 		return -- superseded
 	end
+
+	if Util.isLoading() then
+		rosterBuild = nil
+		return
+	end
+
 	local budget = C.ROSTER_SLICE
 	while budget > 0 do
 		local club = build.clubs[build.c]
@@ -369,6 +379,7 @@ local function stepRosterBuild(build)
 					end
 					if PRESENCE_ONLINE[info.presence] then
 						t.onlineByName[key] = true
+						t.offlineByName[key] = nil
 						-- Faction can be absent on this club's record; any
 						-- club's claim counts. Unknown members defer to
 						-- end-of-build so a later club can supply it.
@@ -390,12 +401,19 @@ local function stepRosterBuild(build)
 								guild = club.guild == true,
 							}
 						end
+
+					elseif Enum.ClubMemberPresence
+						and info.presence == Enum.ClubMemberPresence.Offline
+						and not t.onlineByName[key]
+					then
+						t.offlineByName[key] = true
+
 					end
 				end
 			end
 		end
 	end
-	C_Timer.After(0, stepCurrentBuild)
+	build.timer = C_Timer.NewTimer(0, stepCurrentBuild)
 end
 
 -- Hoisted reschedule closure so the timer allocates nothing per slice.
@@ -416,6 +434,11 @@ stepCurrentBuild = function()
 end
 
 local function startRosterBuild()
+
+	if Util.isLoading() then
+		return
+	end
+
 	-- Never overlap builds. Callers guard too, but the check belongs here:
 	-- a second start would wipe the back buffer out from under the
 	-- in-flight build. Returns true only when a build actually started.
@@ -474,6 +497,7 @@ local function startRosterBuild()
 	wipe(back.guildByName)
 	wipe(back.communityByName)
 	wipe(back.onlineByName)
+	wipe(back.offlineByName)
 	wipe(buildSeenXfac)
 	wipe(buildSeenGuild)
 	rosterBuild = {
@@ -511,6 +535,17 @@ end
 
 local lastUiRosterRefresh = 0
 
+function Util.pauseForLoading()
+	if rosterBuild and rosterBuild.timer then
+		rosterBuild.timer:Cancel()
+	end
+
+	rosterBuild = nil
+	rosterReady = false
+	lastUiRosterRefresh = -math.huge
+
+end
+
 --- Kick a roster rebuild immediately, ignoring the memo window (unless a
 -- build is already in flight). Used when the Communities UI opens and on
 -- CLUB_MEMBERS_UPDATED.
@@ -527,20 +562,26 @@ end
 --- Online opposite-faction club members we can reach by addon whisper.
 -- @return table List of "Name-Realm" strings, deduplicated by GUID.
 function Util.xfacClubMembers()
-	return clubRoster().xfac
+
+	local roster = clubRoster()
+	return rosterReady and roster.xfac or unavailableRoster
+
 end
 
 --- Whether a "Name-Realm" is an opposite-faction member of our clubs.
 function Util.isXfacClubMember(unitID)
 	local key = normalizeUnitName(unitID)
 	local faction = key and clubRoster().factionByName[key]
-	return faction ~= nil and faction ~= selfFaction()
+	return rosterReady and faction ~= nil and faction ~= selfFaction()
 end
 
 --- Online opposite-faction members of our own guild (cross-faction guilds).
 -- @return table List of "Name-Realm" strings, deduplicated by GUID.
 function Util.xfacGuildMembers()
-	return clubRoster().xfacGuild
+
+	local roster = clubRoster()
+	return rosterReady and roster.xfacGuild or unavailableRoster
+
 end
 
 --- Whether a "Name-Realm" is a member of our guild (per the roster memo).
@@ -553,7 +594,17 @@ end
 -- Mobile-app presences count as offline.
 function Util.isClubMemberOnline(unitID)
 	local key = normalizeUnitName(unitID)
-	return key ~= nil and clubRoster().onlineByName[key] == true
+
+	local roster = clubRoster()
+	return rosterReady and key ~= nil and roster.onlineByName[key] == true
+end
+
+-- //edit: missing data doesnt mean that someone is offline
+function Util.isClubMemberOffline(unitID)
+	local key = normalizeUnitName(unitID)
+	local roster = clubRoster()
+	return rosterReady and key ~= nil and roster.offlineByName[key] == true
+
 end
 
 --- Whether a "Name-Realm" is a member of one of our (non-guild) communities.
@@ -832,10 +883,16 @@ function Util.canWeUse(...)
 	return true
 end
 
+function Util.isLoading()
+	local comms = ns.comms
+	return comms ~= nil and (comms.loading or GetTime() < (comms.resumeAt or 0)) or false
+end
+
 --- Whether comms must stay silent: combat lockdown, a chat-messaging
 -- lockdown (encounters, M+), or an active challenge-mode run.
 function Util.commsRestricted()
-	return InCombatLockdown()
+	return Util.isLoading()
+		or InCombatLockdown()
 		or C_ChatInfo.InChatMessagingLockdown()
 		or C_ChallengeMode.IsChallengeModeActive()
 end

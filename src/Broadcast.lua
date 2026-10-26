@@ -171,6 +171,34 @@ function Broadcast:start()
 	end)
 end
 
+function Broadcast:pauseForLoading()
+
+-- //edit: Keep cached profiles but do not resume transfers
+	for _, peer in pairs(self.relays) do
+		if peer.ign == 0 then
+			peer.pr, peer.lp = 0, 0
+		end
+	end
+
+	wipe(self.requests)
+	wipe(self.reqQueued)
+	wipe(self.reqQueueOrder)
+	self.reqQueueOrder.head, self.reqQueueOrder.tail = 1, 0
+	wipe(self.pendingServes)
+
+	for _, pending in pairs(self.freshenPending) do
+		if pending.mode == "fetch" then
+			self.fetchCache[pending.subject] = nil
+		end
+	end
+
+	wipe(self.freshenPending)
+	wipe(self.fanoutInFlight)
+	self.serveDrainPos = nil
+	self.serveDrainMesh = false
+
+end
+
 -- Helpers -------------------------------------------------------------------
 
 --- Fetch-or-create the relay record for `key`; `name` refreshes the
@@ -202,7 +230,7 @@ function Broadcast:whisperProbeTarget(now)
 		local key = Util.normalizeUnitName(name)
 		local target = Util.fullUnitName(name)
 		-- Realms can fail to resolve entirely mid-transition. Move on.
-		if key and target and target:sub(-1) ~= "-" then
+		if key and target and target:sub(-1) ~= "-" and ns.comms:canWhisper(target) then
 			local p = self.relays[key]
 			if p and p.ign == 0 then
 				local fresh = p.conf ~= 0
@@ -291,6 +319,12 @@ end
 --- One-time broadcast of our addon version on the comm channel. Retried
 -- while the channel join pends; gives up after C.VER_BROADCAST_ATTEMPTS.
 function Broadcast:broadcastVersion()
+	if Util.isLoading() then
+		self.versionPending = true
+		return
+	end
+	self.versionPending = nil
+
 	local version = ownVersion()
 	-- Dev or prerelease suffixed versions stay quiet.
 	if version:find("[^%d%.]") then
@@ -411,6 +445,10 @@ end
 
 --- BNet and whisper probe rotations plus exchange expiry, one ticker.
 function Broadcast:tick()
+	if Util.isLoading() then
+		return
+	end
+
 	local now = GetTime()
 	local comms = ns.comms
 	local restricted = Util.commsRestricted()
@@ -420,9 +458,20 @@ function Broadcast:tick()
 	-- for stranger subjects; everything else drops to the subject cooldown.
 	local pump = false
 	for guid, req in pairs(self.requests) do
+		if restricted and req.state == "contact" and req.sentAt then
+			req.responseRestricted = true
+		end
+
 		if req.state == "contact"
-			and (now - req.at) > C.REQ_CONTACT_TIMEOUT
+			and (req.sendFailed
+				or now > (req.sentAt and (req.sentAt + C.REQ_CONTACT_TIMEOUT)
+					or req.sendDeadline or (req.at + C.REQ_CONTACT_TIMEOUT)))
+
 		then
+			if req.medium == "WHISPER" and req.sentAt and not req.responseRestricted then
+				ns.comms:backoffWhisper(req.target)
+			end
+
 			if not self:tryChannelFallback(guid, req, now) then
 				pump = dropReq(self, guid, req, now, "dropped (contact silent)")
 			end
@@ -523,7 +572,7 @@ function Broadcast:tick()
 					ns.debugPeer("whisper " .. key
 						.. " dropped (realm unresolved)")
 				end
-			elseif p.ign ~= 0 and not Util.isClubMemberOnline(p.name or key) then
+			elseif p.ign ~= 0 and Util.isClubMemberOffline(p.name or key) then
 				p.ign, p.pr = 0, 0
 				if ns.debugPeer then
 					ns.debugPeer("whisper " .. tostring(p.name or key)
@@ -739,7 +788,7 @@ function Broadcast:deckLive(entry, now)
 		return ns.comms:isBNetConfirmed(entry.target, now)
 	end
 	local p = self.relays[entry.key]
-	return p ~= nil and p.conf ~= 0
+	return p ~= nil and p.conf ~= 0 and ns.comms:canWhisper(entry.target)
 		and (now - p.conf) < C.RELAY_CONFIRM_TTL
 		and Util.isClubMemberOnline(p.name)
 		and (Util.isGuildClubMember(p.name)
@@ -757,6 +806,7 @@ function Broadcast:deckRefresh(now)
 	end
 	for key, p in pairs(self.relays) do
 		if p.conf ~= 0 and (now - p.conf) < C.RELAY_CONFIRM_TTL
+			and ns.comms:canWhisper(p.name)
 			and Util.isClubMemberOnline(p.name)
 		then
 			if Util.isGuildClubMember(p.name) then
@@ -827,6 +877,7 @@ function Broadcast:issueRequest(guid, unitID, now)
 	local chunks = self:buildCtl("REQ", reqArg(guid, unitID))
 	local comms = ns.comms
 	local contact = self:reqContact(guid, now)
+	local queueStart = comms.queue.tail
 	if not contact
 		or not self:sendToPeer(chunks, contact.medium, contact.target)
 	then
@@ -842,15 +893,28 @@ function Broadcast:issueRequest(guid, unitID, now)
 		return
 	end
 	self.fanoutInFlight[#self.fanoutInFlight + 1] = comms.queue.tail
+
+	local req = {
+		state = "contact", at = now, unitID = unitID,
+		medium = contact.medium, target = contact.target,
+		sendDeadline = now + C.REQ_CONTACT_TIMEOUT + comms:queueDepth() / C.SEND_RATE,
+	}
+
+	self.requests[guid] = req
+-- //edit: queue time is not silence from the contact so start waiting after this request leaves our queue
+	for i = queueStart + 1, comms.queue.tail 
+	do
+		local desc = comms.queue[i]
+		desc.contactRequest = req
+		desc.contactSubject = guid
+		desc.contactLast = i == comms.queue.tail
+	end
+
 	if ns.debugEnabled("targets") then
 		for _, name in pairs(self.forcedTargets) do
 			comms:sendChunksAddon(chunks, "WHISPER", name)
 		end
 	end
-	self.requests[guid] = {
-		state = "contact", at = now, unitID = unitID,
-		medium = contact.medium, target = contact.target,
-	}
 	if ns.statsLeg then
 		ns.statsLeg("req", 1)
 	end
@@ -1038,6 +1102,7 @@ function Broadcast:hasContact(guid, now)
 	end
 	for _, p in pairs(self.relays) do
 		if p.conf ~= 0 and (now - p.conf) < C.RELAY_CONFIRM_TTL
+			and ns.comms:canWhisper(p.name)
 			and Util.isClubMemberOnline(p.name)
 			and (Util.isGuildClubMember(p.name)
 				or Util.isCommunityClubMember(p.name))
@@ -1127,6 +1192,9 @@ end
 
 --- Send the requested profile directly to a granted peer.
 function Broadcast:serveData(serve)
+	if Util.isLoading() then
+		return
+	end
 	local adapter = ns.getAvailableAdapter()
 	local profile = adapter and adapter:extract(serve.unitID)
 	local encoded = profile and Serializer.encodeProfile(profile.data)
@@ -1401,8 +1469,9 @@ function Broadcast:serveUnicast(subject, unitID, adapter, medium, target,
 			mode = "serve", subject = subject, unitID = unitID,
 			medium = medium, target = target,
 		}
+		local pending = self.freshenPending[key]
 		C_Timer.After(C.REQ_FRESHEN_DELAY, function()
-			self:flushFreshen(key)
+			self:flushFreshen(key, pending)
 		end)
 		if ns.debugPeer then
 			ns.debugPeer("freshen " .. Util.nameForGuid(subject)
@@ -1414,9 +1483,9 @@ end
 --- Resolve a deferred REQ on timer expiry or landed data. Re-checks the
 -- serve gate, which can change during the wait; channel entries also
 -- re-check the cooldown.
-function Broadcast:flushFreshen(key)
+function Broadcast:flushFreshen(key, expected)
 	local entry = self.freshenPending[key]
-	if not entry then
+	if Util.isLoading() or not entry or (expected and entry ~= expected) then
 		return
 	end
 	self.freshenPending[key] = nil
@@ -1427,6 +1496,9 @@ function Broadcast:flushFreshen(key)
 	-- The profile could have been purged during the deferral. A fetch
 	-- lapsing with nothing landed fails canServe the same way.
 	if not (adapter and adapter.canServe and adapter:canServe(entry.unitID)) then
+		if entry.mode == "fetch" then
+			self.fetchCache[entry.subject] = nil
+		end
 		return
 	end
 	if entry.mode == "fetch" then
@@ -1455,6 +1527,9 @@ end
 --- A unit's register profile was written (our freshen query, native exchange,
 -- MSP merge, profileID rebind): flush deferred ACKs waiting on that unit.
 function Broadcast:onFreshenReceived(unitID)
+	if Util.isLoading() then
+		return
+	end
 	for key, entry in pairs(self.freshenPending) do
 		if entry.unitID == unitID then
 			self:flushFreshen(key)
@@ -1465,10 +1540,13 @@ end
 --- Dispatch an inbound control message. Reachable on every medium; the
 -- HELLO/HI verbs only carry meaning over BNet.
 function Broadcast:onControl(msg, context)
+	if Util.isLoading() then
+		return
+	end
 	local comms = ns.comms
 	local now = GetTime()
 	local verb, arg, arg2, arg3, arg4, arg5, arg6 =
-		msg.data:match("^FRP1 (%S+)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)")
+		msg.data:match("^FRP1 (%S+)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)")
 	if not verb then
 		return
 	end
@@ -1580,8 +1658,9 @@ function Broadcast:onControl(msg, context)
 						reqAt = reqAt, reqPid = arg4, reqCvh = arg5,
 						mesh = meshReq,
 					}
+					local pending = self.freshenPending[key]
 					C_Timer.After(C.REQ_FRESHEN_DELAY, function()
-						self:flushFreshen(key)
+						self:flushFreshen(key, pending)
 					end)
 					if peer then
 						peer("freshen " .. arg .. " (defer ack -> "
@@ -1637,8 +1716,9 @@ function Broadcast:onControl(msg, context)
 						medium = context.medium, target = target,
 						reqAt = reqAt, reqPid = arg4, reqCvh = arg5,
 					}
+					local pending = self.freshenPending[key]
 					C_Timer.After(C.REQ_FETCH_DELAY, function()
-						self:flushFreshen(key)
+						self:flushFreshen(key, pending)
 					end)
 					if peer then
 						peer("fetch " .. arg .. " (pull on demand -> "
@@ -1773,6 +1853,9 @@ end
 
 --- Handle a fully-reassembled inbound message.
 function Broadcast:onMessage(raw, context)
+	if Util.isLoading() then
+		return
+	end
 	local msg = Serializer.parseMessage(raw)
 	-- A non-numeric originTime would break the cache's ordering compare.
 	if not msg or type(msg.originTime) ~= "number" then
@@ -1811,6 +1894,10 @@ function Broadcast:onMessage(raw, context)
 			p.conf = GetTime()
 			p.pr = 0
 			p.ign = 0
+
+-- //Edit: We have a reply so failures before should not block this contact
+			ns.comms.whisperBackoff[key] = nil
+			ns.comms.whisperAttempts[key] = nil
 		end
 	end
 	-- Any parseable BNet message confirms the account runs FactionRP.
@@ -1915,6 +2002,9 @@ end
 
 --- Drain up to INJECT_BURST pending injections per tick.
 function Broadcast:drainInject()
+	if Util.isLoading() then
+		return
+	end
 	local o = self.injectOrder
 	local head = o.head
 	local budget = C.INJECT_BURST

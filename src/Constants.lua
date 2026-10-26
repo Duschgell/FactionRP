@@ -46,6 +46,12 @@ C.POOL_SEND_DESC = 256
 -- dropping individual chunks yields an incomplete message anyway.
 C.SEND_QUEUE_CAP = 384
 
+-- //edit: we let names and club data settle before starting to work again
+C.LOADING_RESUME_DELAY = 3
+C.WHISPER_FAILURE_TTL = 60
+C.WHISPER_ERROR_WINDOW = 10
+C.REFRESH_QUERY_INTERVAL = 10
+
 -- FRP1 control channel -----------------------------------------------------
 -- Control messages are 7-field envelopes whose subject is CTL_SUBJECT
 -- (subjects are always GUIDs, so "_frp" never collides). The data field

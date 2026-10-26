@@ -12,6 +12,18 @@ ns.Comms = Comms
 
 local bnKeys = {} -- [gameAccountID] = "bn:<id>" senderKey (persistent)
 
+local function noteRestrictedResponses()
+-- //edit:we may drop the answer during our own loading. Keep the contact later
+	if not ns.broadcast then
+		return
+	end
+	for _, request in pairs(ns.broadcast.requests) do
+		if request.state == "contact" and request.sentAt then
+			request.responseRestricted = true
+		end
+	end
+end
+
 function Comms:init()
 	self.prefix = C.MSG_PREFIX
 	self.assembler = ns.Serializer.ChunkReassembler:new()
@@ -38,7 +50,12 @@ function Comms:init()
 	self.meshSize = 0
 	-- Loading-screen flag: realm names resolve unreliably mid-transition
 	-- (issue #26), so roster/name work pauses while it is up.
-	self.loading = false
+	self.loading = IsLoggedIn ~= nil and not IsLoggedIn()
+	self.initialLoading = self.loading
+	self.resumeAt = 0
+	self.loadGeneration = 0
+	self.whisperBackoff = {}
+	self.whisperAttempts = {}
 	self.restricted = false -- edge flag: partials pruned once per restriction
 	-- Scratch transport contexts, mutated per inbound event. Valid only
 	-- for the duration of the synchronous handler call; do not retain.
@@ -59,7 +76,7 @@ function Comms:start()
 	-- Channel/group addon traffic echoes back to the sender; remember our
 	-- normalized name so the echo can be dropped at intake.
 	local ownName = GetUnitName("player", true)
-	if ns.Util.canWeUse(ownName) then
+	if not ns.Util.isLoading() and ns.Util.canWeUse(ownName) then
 		self.ownName = ns.Util.normalizeUnitName(ownName)
 	end
 
@@ -73,10 +90,9 @@ function Comms:start()
 	end)
 
 	-- (Re)join the hidden channel whenever we (re)enter the world.
-	ns.RegisterEvent("PLAYER_ENTERING_WORLD", function()
+	if not ns.Util.isLoading() then
 		self:joinChannel()
-	end)
-	self:joinChannel()
+	end
 
 	-- Member counts feed meshSize, which scales the serve cooldown and
 	-- gates REQ sampling. Roster updates carry the same count and signal
@@ -89,11 +105,8 @@ function Comms:start()
 	ns.RegisterEvent("CHANNEL_COUNT_UPDATE", onChannelCount)
 	ns.RegisterEvent("CHANNEL_ROSTER_UPDATE", onChannelCount)
 
-	ns.RegisterEvent("LOADING_SCREEN_ENABLED", function()
-		self.loading = true
-	end)
-	ns.RegisterEvent("LOADING_SCREEN_DISABLED", function()
-		self.loading = false
+	ns.RegisterEvent("CHAT_MSG_SYSTEM", function(_, message)
+		self:onWhisperError(message)
 	end)
 
 	-- Every presence event refreshes the account memo, but only an account
@@ -135,6 +148,9 @@ function Comms:start()
 		self:flushQueue()
 	end)
 	self.pruneTicker = C_Timer.NewTicker(C.REASSEMBLY_TIMEOUT / 2, function()
+		if ns.Util.isLoading() then
+			return
+		end
 		local dropped = self.assembler:prune(C.REASSEMBLY_TIMEOUT)
 		if dropped > 0 and ns.statsPruned then
 			ns.statsPruned(dropped)
@@ -145,7 +161,160 @@ function Comms:start()
 				self.lastChunkFrom[key] = nil
 			end
 		end
+
+		for key, at in pairs(self.whisperAttempts) do
+			if GetTime() - at > C.WHISPER_ERROR_WINDOW then
+				self.whisperAttempts[key] = nil
+			end
+		end
+		for key, untilAt in pairs(self.whisperBackoff) do
+			if GetTime() >= untilAt then
+				self.whisperBackoff[key] = nil
+			end
+		end
+
 	end)
+end
+
+function Comms:pauseForLoading()
+	self.loading = true
+	self.initialLoading = false
+	self.resumeAt = 0
+	self.loadGeneration = self.loadGeneration + 1
+
+-- //edit: Old transfered data should not start sending after we finish the teleport
+	local q = self.queue
+	for i = q.head, q.tail do
+		self.descRelease(q[i])
+		q[i] = nil
+	end
+
+	q.head, q.tail = 1, 0
+	self.sendCredit = 0
+
+	for sender in pairs(self.assembler.buffers) do
+		self.assembler:drop(sender)
+	end
+
+	wipe(self.lastChunkFrom)
+	ns.Util.pauseForLoading()
+
+	for _, peer in pairs(self.bnetPeers) do
+		if peer.ignoredAt == 0 then
+			peer.probeSentAt = 0
+		end
+	end
+
+	if ns.broadcast then
+		ns.broadcast:pauseForLoading()
+	end
+	if ns.scanner then
+		ns.scanner:cancelHover()
+	end
+end
+
+function Comms:resumeAfterLoading()
+	self.loadGeneration = self.loadGeneration + 1
+	local generation = self.loadGeneration
+	self.resumeAt = GetTime() + C.LOADING_RESUME_DELAY
+
+	C_Timer.After(C.LOADING_RESUME_DELAY, function()
+		if self.loading or generation ~= self.loadGeneration then
+			return
+		end
+
+		self.resumeAt = 0
+		local ownName = GetUnitName("player", true)
+
+		if ns.Util.canWeUse(ownName) then
+			self.ownName = ns.Util.normalizeUnitName(ownName)
+		end
+
+		self:joinChannel()
+		ns.Util.refreshClubRoster()
+
+		if ns.scanner then
+			ns.scanner:shareSelf()
+		end
+
+		if ns.broadcast and ns.broadcast.versionPending then
+			ns.broadcast:broadcastVersion()
+		end
+
+	end)
+end
+
+function Comms:canWhisper(target)
+	local key = ns.Util.normalizeUnitName(target)
+
+	if not key or GetTime() < (self.whisperBackoff[key] or 0)
+		or ns.Util.isClubMemberOffline(target)
+	then
+		return false
+	end
+
+	local relay = ns.broadcast and ns.broadcast.relays[key]
+	return relay == nil or ns.Util.isClubMemberOnline(target)
+
+end
+
+function Comms:backoffWhisper(target)
+
+	local key = ns.Util.normalizeUnitName(target)
+
+	if key then
+		self.whisperBackoff[key] = GetTime() + C.WHISPER_FAILURE_TTL
+	end
+end
+
+function Comms:onWhisperError(message)
+	local format = ERR_CHAT_PLAYER_NOT_FOUND_S
+
+	if type(message) ~= "string" or type(format) ~= "string"
+		or not ns.Util.canWeUse(message)
+	then
+		return
+	end
+
+	local first, last = format:find("%s", 1, true)
+
+	if not first then
+		first, last = format:find("%1$s", 1, true)
+	end
+
+	if not first then
+		return
+	end
+
+	local prefix, suffix = format:sub(1, first - 1), format:sub(last + 1)
+
+	if message:sub(1, #prefix) ~= prefix
+		or (#suffix > 0 and message:sub(-#suffix) ~= suffix)
+	then
+
+		return
+	end
+
+	local name = message:sub(#prefix + 1, #message - #suffix)
+	local matched
+
+	for target, at in pairs(self.whisperAttempts) do
+		if GetTime() - at <= C.WHISPER_ERROR_WINDOW
+			and (target == ns.Util.normalizeUnitName(name)
+				or (not name:find("-", 1, true) and target:match("^([^-]+)") == name:lower()))
+		then
+			if matched then
+				return
+			end
+			matched = target
+		end
+	end
+
+-- //Edit: only react to whisper errors we actually sent recently
+	if matched then
+		self:backoffWhisper(matched)
+		self.whisperAttempts[matched] = nil
+	end
 end
 
 --- Set the callback that receives fully-reassembled messages.
@@ -185,6 +354,10 @@ end
 --- Join the hidden same-faction channel. Joining fires CHANNEL_UI_UPDATE
 -- churn in the client even when already joined, so skip when we are in.
 function Comms:joinChannel()
+	if ns.Util.isLoading() then
+		return
+	end
+
 	self:leaveForeignChannels()
 	if self:channelIndex() then
 		return -- already in the channel; nothing to do
@@ -249,6 +422,11 @@ end
 
 --- Queue a send descriptor for paced delivery.
 function Comms:enqueue(desc)
+	if ns.Util.isLoading() then
+		self.descRelease(desc)
+		return false
+	end
+
 	local q = self.queue
 	q.tail = q.tail + 1
 	q[q.tail] = desc
@@ -260,6 +438,39 @@ end
 --- Dispatch a queued descriptor through Chomp (or the raw fallback),
 -- recording stats hooks. The descriptor is released after dispatch.
 function Comms:sendDescriptor(desc)
+	if ns.Util.isLoading() then
+		return
+	end
+
+	local request = desc.contactRequest
+
+	if request and (not ns.broadcast
+		or ns.broadcast.requests[desc.contactSubject] ~= request
+		or request.state ~= "contact" or request.sendFailed)
+	then
+		return
+	end
+
+	if request and not request.sentAt and request.sendDeadline
+		and GetTime() > request.sendDeadline
+	then
+		request.sendFailed = true
+		return
+	end
+
+	if desc.kind == "WHISPER" then
+		if not self:canWhisper(desc.target) then
+			if request then
+				request.sendFailed = true
+			end
+			return
+		end
+
+		local key = ns.Util.normalizeUnitName(desc.target)
+		self.whisperAttempts[key] = GetTime()
+
+	end
+
 	local text = desc.text
 	if desc.kind == "CHANNEL" then
 		-- Resolve the index at dispatch; a reorder between enqueue and
@@ -284,6 +495,12 @@ function Comms:sendDescriptor(desc)
 	if desc.legTotal and ns.statsOutLeg then
 		ns.statsOutLeg(desc.kind, desc.target, desc.legBytes, desc.legTotal, GetTime() - desc.legStartedAt)
 	end
+
+	if request and desc.contactLast then
+		request.sentAt = GetTime()
+		request.at = request.sentAt
+	end
+
 	local chomp = AddOn_Chomp
 	if desc.mode == "bnet" then
 		-- BNet sends share ChatThrottleLib's queue via Chomp when present.
@@ -311,6 +528,7 @@ function Comms:flushQueue()
 	-- Hold all sends while restricted; the queue drains after. On entry,
 	-- drop partial inbound buffers: their missing chunks can never arrive.
 	if ns.Util.commsRestricted() then
+		noteRestrictedResponses()
 		if not self.restricted then
 			self.restricted = true
 			self.assembler:prune(0)
@@ -350,6 +568,11 @@ end
 -- @param target any    Channel index (for CHANNEL) or player name (for WHISPER).
 -- @return table The queued descriptor (callers may stamp leg-completion fields).
 function Comms:sendAddon(text, kind, target)
+
+	if ns.Util.isLoading() then
+		return
+	end
+
 	local desc = self.descAcquire()
 	desc.mode = "addon"
 	desc.text = text
@@ -363,6 +586,10 @@ end
 
 --- Send one raw chunk to a Battle.net game account.
 function Comms:sendBNet(text, gameAccountID)
+	if ns.Util.isLoading() then
+		return
+
+	end
 	local desc = self.descAcquire()
 	desc.mode = "bnet"
 	desc.text = text
@@ -385,6 +612,10 @@ end
 -- @return number|false Chunk count queued, or false when the whole leg was
 --   dropped for capacity. Callers must not mark work as sent on false.
 function Comms:sendChunksAddon(chunks, kind, target)
+	if ns.Util.isLoading() or (kind == "WHISPER" and not self:canWhisper(target)) then
+		return false
+	end
+
 	local n = #chunks
 	if not legFits(self, n) then
 		if ns.statsError then
@@ -410,6 +641,10 @@ end
 --- Send a chunk list over a named custom channel (e.g. a previous-generation
 -- channel for the version announcement). Resolves to an index at dispatch.
 function Comms:sendChunksChannel(chunks, channelName)
+	if ns.Util.isLoading() then
+		return false
+	end
+
 	local n = #chunks
 	if not legFits(self, n) then
 		if ns.statsError then
@@ -434,6 +669,10 @@ function Comms:sendChunksChannel(chunks, channelName)
 end
 
 function Comms:sendChunksBNet(chunks, gameAccountID)
+	if ns.Util.isLoading() then
+		return false
+
+	end
 	local n = #chunks
 	if not legFits(self, n) then
 		if ns.statsError then
@@ -713,6 +952,7 @@ end
 
 function Comms:handleIncoming(chunkString, context)
 	if ns.Util.commsRestricted() then
+		noteRestrictedResponses()
 		return -- inbound chunks are dropped outright while restricted
 	end
 	-- Reassembly is keyed by a stable per-sender identity.
@@ -746,6 +986,29 @@ end
 
 -- Singleton, started after login.
 ns.comms = Comms:new()
+
+-- //edit: register before the login so we also get this loading screen
+ns.RegisterEvent("LOADING_SCREEN_ENABLED", function()
+	ns.comms:pauseForLoading()
+end)
+
+ns.RegisterEvent("LOADING_SCREEN_DISABLED", function()
+	ns.comms.loading = false
+	ns.comms.initialLoading = false
+	ns.comms:resumeAfterLoading()
+end)
+
+ns.RegisterEvent("PLAYER_ENTERING_WORLD", function()
+	local comms = ns.comms
+	if comms.initialLoading or not comms.loading then
+		comms:pauseForLoading()
+		comms.loading = false
+	end
+
+	comms:resumeAfterLoading()
+
+end)
+
 ns.OnLogin(function()
 	ns.comms:start()
 end)
