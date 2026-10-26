@@ -139,6 +139,17 @@ local function printFlags()
 end
 
 local function setFlag(key, on)
+	-- write every flag when toggling `all`.
+	if key == "all" then
+		for _, cat in ipairs(C.DEBUG_CATEGORIES) do
+			ns.db.debug[cat.key] = on
+		end
+	elseif ns.db.debug.all then
+		for _, cat in ipairs(C.DEBUG_CATEGORIES) do
+			ns.db.debug[cat.key] = true
+		end
+		ns.db.debug.all = false
+	end
 	ns.db.debug[key] = on
 	ns.refreshDebugHooks()
 	ns.Print(("debug |cff66ccff%s|r %s"):format(key, flagText(ns.db.debug[key])))
@@ -274,8 +285,14 @@ ns.RegisterCommand("relays", function()
 		b.reqQueueOrder and math.max(0, b.reqQueueOrder.tail - b.reqQueueOrder.head + 1) or 0,
 		mapSize(b.pendingServes or {}),
 		b.fanoutsInFlight and b:fanoutsInFlight() or 0, mute))
-	ns.Print(("contact cursor: %d | pinned targets: %d"):format(
-		b.contactIdx or 0, mapSize(b.forcedTargets or {})))
+	local decks = b.contactDecks or {}
+	local deckStr = {}
+	for tier = 1, 3 do
+		local d = decks[tier]
+		deckStr[tier] = d and ("%d/%d"):format(#d.draw, #d.spent) or "0/0"
+	end
+	ns.Print(("contact decks | bnet %s | guild %s | comm %s | pinned: %d"):format(
+		deckStr[1], deckStr[2], deckStr[3], mapSize(b.forcedTargets or {})))
 end, "Show learned relays/contacts and the pull pipeline state")
 
 -- Richer status command (overrides the placeholder registered in Core).

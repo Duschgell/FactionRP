@@ -1,5 +1,28 @@
 ﻿# FactionRP Changelog
 
+## 0.4.5
+
+### Changed
+- On a dense mesh (more than 10 channel members), the fallback profile REQ is whispered to 3 random channel members instead of broadcast to everyone. Holders keep the ACK/OK arbitration, so only the best offer serves.
+- Unicast serves now wait for the requester's OK grant like channel serves do. Denied or obsolete offers expire instead of costing a data leg.
+- The mesh channel REQ now only fires while we hold no confirmed relay at all (BNet, guild, community). Failed contacts drop the subject to cooldown instead of broadcasting.
+- Contact picks now come from per-tier shuffled decks (BNet, guild, community) instead of a cursor over a shared list order, so the same members no longer absorb everyone's first requests. Each contact still serves at most once per cycle.
+- Fixed issue where Unicast REQ wasn't correctly prompting relays to pull a profile.
+
+### Fixes
+- Sometimes a transition would cause realmnames to disappear from character data. If realmname is missing or unresolvable, drop relay probe.
+
+## 0.4.4
+
+### Changed
+- Mouseover profile requests are now delayed by 3 seconds, indicated by a progress bar on the tooltip.
+- Attempt pull without delay when targeting.
+
+### Fixes
+- Club roster was never built unless the Communities panel had been opened. It is now fixed.
+- FRP now has a visible delay before it requests profiles. Targeting a person will still issue a request immediately.
+- `/frp debug all` toggling was malfunctioning and didn't toggle all like expected.
+
 ## 0.4.3
 
 - Fixed TRP3 version display
