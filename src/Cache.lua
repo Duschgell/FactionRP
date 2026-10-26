@@ -227,6 +227,10 @@ end
 -- kept: no adapter is not proof of absence. A changed register profileID
 -- means the subject switched profiles; the record re-anchors to its stamp.
 function Cache:sweepSeen()
+	if ns.Util.isLoading() then
+		return
+	end
+
 	local seen = ns.db and ns.db.seen
 	if not seen then
 		return
@@ -250,6 +254,10 @@ end
 
 --- Remove all expired entries. Invoked on a timer; safe to call manually.
 function Cache:sweep()
+	if ns.Util.isLoading() then
+		return
+	end
+
 	local now = GetTime()
 	for guid, entry in pairs(self.entries) do
 		if isExpired(entry, now) then
