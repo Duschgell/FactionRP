@@ -33,8 +33,8 @@ those whisper-reachable targets. BNet works between any friends and ignores
 faction entirely.
 
 **Every leg is a single hop.** The requester unicasts `REQ` to one contact
-at a time; a recipient that can serve replies `ACK` and sends the profile
-*directly* to the requester. "Relay" in this document means a reachable
+at a time; a recipient that can serve replies `ACK` and, once granted
+with `OK`, sends the profile *directly* to the requester. "Relay" in this document means a reachable
 cross-faction *endpoint* — never a forwarder: no client relays or re-sends
 anything on behalf of another. `REQ`s are broadcast only as a fallback,
 once per request and only for stranger subjects (see "The pull exchange");
@@ -131,7 +131,7 @@ decode `data` as a profile, and drop it harmlessly.
 | `HELLO` | addonVer            | BNet probe — "I run FactionRP"              |
 | `HI`    | addonVer            | handshake reply                             |
 | `VER`   | addonVer            | one-time version broadcast on login (see below) |
-| `REQ`   | subjectGuid [unitID] [seenAt] [pid] [cvHash] | pull request — "who can serve this profile?" |
+| `REQ`   | subjectGuid [unitID] [seenAt] [pid] [cvHash] [m] | pull request — "who can serve this profile?" |
 | `ACK`   | subjectGuid [seenAt]| "I can serve it, as of `seenAt`"            |
 | `OK`    | subjectGuid         | grant — "you may send it"                   |
 | `NOK`   | subjectGuid         | cancel — winner mid-send, data landed elsewhere |
@@ -146,6 +146,11 @@ decode `data` as a profile, and drop it harmlessly.
   accepted for the subject (see *Freshness floor* below).
 - `pid` — the profileID the requester's copy is bound to, or `-`.
 - `cvHash` — an 8-hex-char hash of the requester's contentVersion, or `-`.
+- `m` — the sampled-mesh marker: the `REQ` was whispered to a random
+  channel member in place of a broadcast (see *mesh sampling* below). The
+  recipient answers with channel arbitration — `ACK`, then serve only on
+  `OK` — instead of serving a whispered `REQ` at once. Servers too old
+  to parse the field just serve immediately, which still works.
 
 `seenAt`/`pid`/`cvHash` are only sent when `unitID` is present. A server
 whose own claim (`seenAt`) is no newer than `seenAt` *and* whose held
@@ -223,9 +228,12 @@ lifecycle as BNet accounts:
   rebuild (rate-gated `ROSTER_UI_REFRESH`=30s) because member data streams
   in for the UI anyway. `startRosterBuild` itself no-ops while a build is
   in flight, so neither entry point can start or queue an overlapping
-  scan. Clubs whose member data has not streamed are parked for one
-  end-of-build revisit and skipped if still unready — a laggy club never
-  vetoes the rest of the roster.
+  scan. Member data streams only on demand: each unready club gets a
+  `C_Club.FocusMembers` request (the same call the Communities UI makes
+  when a club is selected) and is parked for one end-of-build revisit,
+  then skipped if still unready — a laggy club never vetoes the rest of
+  the roster. `CLUB_MEMBERS_UPDATED` kicks an early rebuild through the
+  same rate gate when a requested stream lands.
 
 `REQ` whisper legs reach only proven targets — confirmed BNet peers and
 confirmed whisper relays; the unconfirmed roster is the probe rotation's
@@ -255,28 +263,38 @@ the goal, awareness is.
 Profiles move on demand. A pull is triggered when the user mouseovers or
 targets an opposite-faction player whose profile we do not hold fresh.
 Requests are **serial**: at most one subject is in flight, and each subject
-is tried against exactly one contact. A round-robin cursor walks the
-contact roster so every contact serves at most one request per cycle:
+is tried against exactly one contact. Picks come from per-tier shuffled
+decks so every contact serves at most one request per cycle:
 
 1. confirmed BNet peers (subject-first when the subject themselves is a
    BNet-reachable FRP peer — a self-serve is authoritative),
 2. confirmed guild-club relays,
 3. confirmed community-club relays.
 
-The cursor wraps after the last contact; new requests resume from the
-first.
+Each tier holds a *draw* and a *spent* pile: newly eligible contacts
+insert at a random draw position, and picks pop the draw head into
+spent. Tier order is cycle ordering, not exhaustion — picks take BNet
+draws until drained, then guild, then community, and only once *every*
+tier's draw is empty do all spent piles reshuffle back for the next
+cycle. The decks decorrelate pick order across clients — a fixed roster
+order would have every holder's first picks land on the same member —
+while contacts that go stale mid-cycle (offline, decayed confirmation)
+drop out at pop time.
 
 ```
 requester                                one contact
     │  REQ <guid> [unitID] [seenAt] [pid] [cvHash] ─► (direct whisper/BNet)
-    │                                          └ can serve? → ACK + data
+    │                                          └ can serve? → ACK
     │                                            cannot?  → silence
     │  ◄── ACK <guid> <seenAt> [dirSeenAt] ── opens the data window
+    │  ── OK <guid> ──► grants the pendingServe
     │  ◄── data envelope ── holder serves direct
 ```
 
 Silence is the only rejection — there is no `NOK` on the unicast path.
-After the ACK the requester waits for the profile; the window is bounded
+After the ACK the requester grants the offer with `OK` and waits for the
+profile; an ungranted pendingServe expires via `SERVE_TIMEOUT`. The window
+is bounded
 by `REQ_DATA_TIMEOUT` (120s, covering TRP3's own 60s query lifetime plus
 margin) and by a stall watch — no chunk from the grantee for
 `REQ_DATA_STALL` (25s) ends it early.
@@ -286,8 +304,19 @@ a silent contact, or a serve that stalled or expired — the subject gets
 one channel attempt *if it is a stranger*: the fallback is skipped when
 the subject shares a guild or community club with us, is a BNet friend,
 or sits in our group, because those relations already provide a native
-or direct pull path. The fallback broadcasts a single `REQ` on
-`frp<N>comms`, collects whispered `ACK` offers for
+or direct pull path. It is also skipped whenever we hold any confirmed
+relay at all — a fresh BNet peer or an online club relay — since the
+mesh exists to cover having *no* proven contacts, not to rescue ones
+that failed. On a thin mesh the fallback broadcasts a single
+`REQ` on `frp<N>comms`; on a mesh larger than `REQ_MESH_SAMPLE_AT` (10)
+members it instead whispers the `REQ` — flagged with the `m` marker —
+to `REQ_MESH_SAMPLE_SIZE` (3) random channel members, because a dense
+mesh would have every holder `ACK` at once. The sample is drawn from
+`C_ChatInfo.GetChannelRosterInfo` (kept current by
+`CHANNEL_COUNT_UPDATE`/`CHANNEL_ROSTER_UPDATE`); if the roster has not
+streamed yet the request simply stays parked in `chan-wait` rather than
+spending a full broadcast. Either way the requester collects whispered
+`ACK` offers for
 `REQ_CHANNEL_WINDOW` (3s), then `OK`s the offer with the best score —
 `max(seenAt claim, dirSeenAt)` where `dirSeenAt` is the server's TRP3
 directory last-seen stamp (`profile.time`), a second freshness signal
@@ -364,18 +393,22 @@ rules (they just hit the per-requester channel throttle harder).
   seen within `SERVE_REFRESH_TTL` (1h), or newer than the requester's
   `seenAt` claim by more than `FRESHNESS_SKEW`. On the unicast
   path the `ACK` goes out immediately (it only marks the requester's data
-  window); the serve itself waits for updated profile data
-  (`REGISTER_DATA_UPDATED`) or `REQ_FRESHEN_DELAY` (2s), so the payload
-  carries post-refresh content. On the channel path the whole `ACK`
+  window); the serve waits for the `OK` grant and, while a freshen is in
+  flight, for updated profile data (`REGISTER_DATA_UPDATED`) or
+  `REQ_FRESHEN_DELAY` (2s), so the payload carries post-refresh content. On the channel path the whole `ACK`
   decision defers the same way, since the claim it advertises must reflect
   the refreshed copy. Deferred replies are bounded (`REQ_FRESHEN_MAX`=16,
   overflow answers immediately) and are never self-requests — we are the
   authority on ourselves. If the adapter cannot or will not refresh, the
-  REQ answers exactly as it would without the feature. A subject we merely
-  know of but hold no profile for is never queried — `canServe` gates the
-  whole branch.
+  REQ answers exactly as it would without the feature. An unserved unit
+  IS pulled on demand (unicast path): the REQ defers as a fetch, queries
+  the author, and serves when data lands or `REQ_FETCH_DELAY` (20s)
+  lapses. Pull parity with `/trp3 open` — the queries are directed at a
+  name-realm string, so any resolved unitID qualifies (`canPull`); the
+  throttle and pending caps bound the abuse surface.
 - Unicast REQs are throttled per sender (`REQ_SENDER_INTERVAL`=2s).
-  Channel REQs are throttled per requester at
+  Channel REQs — including `m`-flagged REQs that arrive by whisper —
+  are throttled per requester at
   `REQ_CHANNEL_SENDER_INTERVAL` (10s) — the same pace clients self-rate
   their own broadcasts at — and bounded by the serve cooldown below, since
   a broadcast can reach many holders at once.
@@ -395,7 +428,7 @@ rules (they just hit the per-requester channel throttle harder).
   we are the authority on ourselves.
 - Misses stay silent — a reply per non-holder costs more than the
   requester's timeout.
-- On the channel path an `ACK <guid> <seenAt> <dirSeenAt>` records a
+- Every `ACK <guid> <seenAt> <dirSeenAt>` records a
   *pending serve* (`SERVE_PENDING_CAP`=16, expires at `SERVE_TIMEOUT`=30s).
   `dirSeenAt` is our TRP3 directory last-seen stamp (`profile.time`) for
   the subject — a second freshness signal the requester weighs alongside
@@ -445,8 +478,8 @@ fallback. The fallback itself fires at most once per request and only for
 strangers, and our own channel REQs are spaced by REQ_CHANNEL_INTERVAL —
 so a crowded scene produces a trickle of single-chunk broadcasts, not the
 per-sighting fanout that made broadcasts delay real requests. Repeated
-cycles only repeat the single-contact pattern — the cursor wraps rather
-than fanning out.
+cycles only repeat the single-contact pattern — the decks reshuffle
+rather than fanning out.
 
 ### Freshness floor
 

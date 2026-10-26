@@ -10,7 +10,7 @@ ns.Const = C
 -- Identity -----------------------------------------------------------------
 
 C.ADDON_NAME = "FactionRP"
-C.VERSION = "0.4.2"
+C.VERSION = "0.4.5"
 
 -- Wire-protocol generation, stamped into every envelope and the channel
 -- name. Peers on a lower PROTO_MAJOR are rejected; bump on breaking changes.
@@ -37,7 +37,7 @@ C.CHUNK_SIZE = 220
 -- Outbound pacing: SEND_RATE chunks per second released on a SEND_INTERVAL
 -- tick via a fractional token bucket (credit capped at SEND_RATE).
 C.SEND_INTERVAL = 0.2
-C.SEND_RATE = 2
+C.SEND_RATE = 1
 
 -- Cap on the reusable send-descriptor pool; sends beyond it just allocate.
 C.POOL_SEND_DESC = 256
@@ -52,10 +52,14 @@ C.SEND_QUEUE_CAP = 384
 -- carries "FRP1 <verb> <arg>". Verbs:
 --   HELLO <version>  BNet peer probe ("I run FactionRP")
 --   HI <version>     handshake reply
---   REQ <subjectGuid> [unitID] [seenAt] [profileID] [cvHash]
+--   REQ <subjectGuid> [unitID] [seenAt] [profileID] [cvHash] [m]
 --      pull-exchange request: "who has this profile?" unitID lets a server
 --      answer straight from the register; seenAt/profileID/cvHash advertise
 --      what the requester already holds so stale holders skip their ACK.
+--      A trailing "m" marks a sampled mesh REQ (see mesh sampling below):
+--      the recipient runs channel REQ arbitration (ACK, then serve only
+--      on OK) instead of serving a whispered REQ at once. Servers too
+--      old to parse arg6 just serve immediately, which still works.
 --   ACK <subjectGuid> <seenAt> [dirSeenAt]
 --      "I can serve it, as of <seenAt>"; dirSeenAt is the server's TRP3
 --      directory last-seen stamp (profile.time), a second freshness signal
@@ -91,24 +95,28 @@ C.BNET_HI_COOLDOWN = 30     -- min gap between HI replies to the same account
 C.REJECTED_SENDER_TTL = 300
 
 -- Pull exchange. Requests are serial: one subject at a time, REQ'd to a
--- single contact (round-robin over confirmed BNet peers, then guild and
--- community relays). A silent contact drops the subject outright unless it
--- is a total stranger (no shared club/guild, no group, no BNet friend):
--- strangers fall back to a single channel REQ, collecting whispered ACKs
--- for REQ_CHANNEL_WINDOW and granting the freshest offer.
-C.REQ_CONTACT_TIMEOUT = 4  -- silent contact drops the request
+-- single contact (per-tier shuffled decks over confirmed BNet peers, then
+-- guild and community relays). A silent contact drops the subject outright
+-- unless it is a total stranger (no shared club/guild, no group, no BNet
+-- friend) AND we hold no confirmed relay: the mesh leg is cold-start
+-- coverage only.
+-- Such strangers fall back to a single channel REQ, collecting whispered
+-- ACKs for REQ_CHANNEL_WINDOW and granting the freshest offer.
+C.REQ_CONTACT_TIMEOUT = 12  -- silent contact drops the request
 C.REQ_DATA_TIMEOUT = 120   -- accepted request expires without data
 C.REQ_DATA_STALL = 25      -- granted serve dies if no chunk lands this long
 C.SERVE_REFRESH_TTL = 3600 -- held copies this fresh serve without a refresh query
 C.REQ_COOLDOWN = 60        -- min gap between requests for the same subject
 C.REQ_BACKLOG_CAP = 8      -- queued subjects awaiting their turn
+C.MOUSEOVER_REQ_DELAY = 3  -- hover this long on an xfac unit before a REQ
 C.REQ_SENDER_INTERVAL = 2  -- min gap between inbound unicast REQs per sender
 C.FANOUT_INFLIGHT_MAX = 3 -- initiated sends (HELLO probes) allowed queued
 C.SERVE_PENDING_CAP = 16 -- bound on granted-or-awaiting serves per peer+subject
 C.SERVE_TIMEOUT = 30     -- pending serve expires without an OK
 
 -- Channel fallback. One broadcast REQ per request, only for stranger
--- subjects. REQs park in "chan-wait" while REQ_CHANNEL_INTERVAL has not
+-- subjects while we hold no confirmed relay. REQs park in "chan-wait"
+-- while REQ_CHANNEL_INTERVAL has not
 -- elapsed since our last broadcast, giving up after REQ_CHANNEL_WAIT_MAX.
 -- Inbound channel REQs are throttled per requester at
 -- REQ_CHANNEL_SENDER_INTERVAL; we self-rate at the same pace, so only
@@ -119,6 +127,13 @@ C.REQ_CHANNEL_WAIT_MAX = 30       -- chan-wait gives up after this
 C.REQ_CHANNEL_SENDER_INTERVAL = 10 -- per-requester inbound channel REQ throttle
 C.REQ_CHANNEL_ACK_CAP = 8         -- offers recorded per broadcast
 
+-- Mesh sampling. Above REQ_MESH_SAMPLE_AT members the channel leg
+-- whispers its REQ (flagged REQ_MESH_FLAG) to REQ_MESH_SAMPLE_SIZE
+-- random members instead of broadcasting, bounding the ACK barrage.
+C.REQ_MESH_SAMPLE_AT = 10   -- mesh size above which channel REQs sample
+C.REQ_MESH_SAMPLE_SIZE = 3  -- random members whispered per sampled REQ
+C.REQ_MESH_FLAG = "m"       -- REQ arg6 marker: sampled mesh request
+
 -- Held-copy suppression: after we accept a profile, local requests for the
 -- subject are suppressed for REQ_HELD_TTL while the RP AddOn's register
 -- still holds it (db.seen[guid].holdUntil). A register purge releases the
@@ -126,9 +141,14 @@ C.REQ_CHANNEL_ACK_CAP = 8         -- offers recorded per broadcast
 C.REQ_HELD_TTL = 1800
 
 -- A servable server refreshes its held copy before ACKing; the reply
--- defers until data lands or the delay elapses.
+-- defers until data lands or the delay elapses. A known-but-unserved unit
+-- instead fetches the profile on demand, deferring for REQ_FETCH_DELAY.
+-- A from-nothing pull runs longer than a refresh.
 C.REQ_FRESHEN_DELAY = 2 -- seconds a serve waits for a refresh
 C.REQ_FRESHEN_MAX = 16  -- bound on deferred replies
+C.REQ_FETCH_DELAY = 20  -- seconds a fetch waits for the pull to land
+C.REQ_FETCH_TTL = 600   -- a pulled subject serves from the register this
+						-- long before another REQ may re-query it
 
 -- Channel serve cooldown: while a granted serve's chunks sit in the send
 -- queue we ACK no broadcast REQs at all, and once a mesh serve's last
