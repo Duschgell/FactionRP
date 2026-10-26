@@ -68,6 +68,10 @@ end
 
 --- Publish the local player's own profile to the cache.
 function Scanner:shareSelf()
+	if ns.Util.isLoading() then
+		return
+	end
+
 	local adapter = ns.getAvailableAdapter()
 	if not adapter then
 		return
@@ -158,6 +162,11 @@ function Scanner:hoverRequest(guid, unitID)
 	self.hoverTimer = C_Timer.NewTimer(C.MOUSEOVER_REQ_DELAY, function()
 		self.hoverTimer = nil
 		self.hoverGuid = nil
+		if ns.Util.isLoading() then
+			return
+
+		end
+
 		local cur = UnitGUID("mouseover")
 		if ns.Util.canWeUse(cur) and cur == guid then
 			self:xfacRequest(guid, unitID)
@@ -191,6 +200,9 @@ end
 -- re-publish user-selected units; an unchanged content version collapses
 -- the feedback to a no-op.
 function Scanner:onAdapterUpdate(adapter, unitID)
+	if ns.Util.isLoading() then
+		return
+	end
 	local guid
 	local playerUnitID = adapter:getPlayerUnitID()
 	if not ns.Util.canWeUse(unitID, playerUnitID) then
@@ -210,6 +222,10 @@ end
 -- section, so we queue a jittered ready time that collapses the burst into
 -- one extraction and keeps simultaneous receipts off the same tick.
 function Scanner:onAdapterReceived(adapter, unitID)
+	if ns.Util.isLoading() then
+		return
+	end
+
 	local playerUnitID = adapter:getPlayerUnitID()
 	if not ns.Util.canWeUse(unitID, playerUnitID)
 		or not unitID or unitID == playerUnitID then
@@ -259,6 +275,10 @@ end
 
 --- Fire at most one ready received-profile publish per tick.
 function Scanner:drainReceived()
+	if ns.Util.isLoading() then
+		return
+
+	end
 	local now = GetTime()
 	local i = 1
 	while i <= #self.receivedQueue do
@@ -295,6 +315,10 @@ end
 -- Repeated publishes would only extend the TTL at an extraction per tick,
 -- so we also stop early when the version matches our last publish.
 function Scanner:share(adapter, unitID, guid)
+	if ns.Util.isLoading() then
+		return
+	end
+
 	local profile = adapter:extract(unitID)
 	if not profile then
 		return

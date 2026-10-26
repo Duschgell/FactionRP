@@ -17,6 +17,7 @@ local TRP3Adapter = ns.Class("TRP3Adapter", ns.ProfileAdapter)
 
 function TRP3Adapter:init()
 	ns.ProfileAdapter.init(self, C.SOURCE.TRP3)
+	self.refreshQueries = {}
 end
 
 --- True only when TRP3 is loaded and every API we depend on is present.
@@ -345,12 +346,37 @@ end
 -- queries /trp3 open makes. Missing or failing API raises one error per
 -- session and disables the feature; callers then serve without a refresh.
 function TRP3Adapter:refreshQuery(unitID)
+
+	if ns.Util.isLoading() then
+		return false
+	end
+
 	if self.refreshDead then
 		return false
 	end
 	if not self:isAvailable() then
 		return false -- TRP3 not loaded right now; not dead, retry later
 	end
+
+	local key = ns.Util.normalizeUnitName(unitID)
+
+	if not key then
+		return false
+	end
+
+	local now = GetTime()
+
+	for name, at in pairs(self.refreshQueries) do
+		if (now - at) >= C.REFRESH_QUERY_INTERVAL then
+			self.refreshQueries[name] = nil
+		end
+	end
+
+-- //edit: Multiple players can ask for the same profile while its still pending
+	if self.refreshQueries[key] then
+		return true
+	end
+
 	local r = TRP3_API.r
 	if type(r) ~= "table"
 		or type(r.sendQuery) ~= "function"
@@ -366,6 +392,8 @@ function TRP3Adapter:refreshQuery(unitID)
 	end, geterrorhandler())
 	if not ok then
 		self.refreshDead = true
+	else
+		self.refreshQueries[key] = now
 	end
 	return ok
 end
@@ -374,6 +402,10 @@ end
 -- Mirrors the sequence TRP3 itself uses when receiving a profile.
 -- @return boolean Whether anything was injected.
 function TRP3Adapter:inject(unitID, data, classID)
+	if ns.Util.isLoading() then
+		return false
+	end
+
 	if not self:isAvailable() then
 		return false
 	end
