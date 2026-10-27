@@ -1,5 +1,10 @@
 ﻿# FactionRP Changelog
 
+## 0.4.6
+
+### Fixes
+- Fix whisper backoff recovery after valid incoming messages, by Duschgell. A successfull whisper marked a player as reachable again, but we kept the old backoff and send attempts. So we knew this player was reachable, but still blocked our replies for up to 60 seconds. This is now fixed.
+
 ## 0.4.5
 
 ### Changed
