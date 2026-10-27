@@ -9,3 +9,4 @@ ignore:
     - doc/
     - .gitignore
     - tools/
+    - .devin/
