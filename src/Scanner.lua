@@ -68,7 +68,7 @@ end
 
 --- Publish the local player's own profile to the cache.
 function Scanner:shareSelf()
-	if ns.Util.isLoading() then
+	if ns.Util.isPaused() then
 		return
 	end
 
@@ -137,6 +137,10 @@ end
 -- and TRP3 already sends its own vernum query on selection, so we skip
 -- our pull for them.
 function Scanner:xfacRequest(guid, unitID)
+	if ns.Util.commsRestricted() then
+		return
+	end
+
 	local adapter = ns.getAvailableAdapter()
 	if adapter and adapter.name == C.SOURCE.TRP3
 		and (ns.Util.isCommunityClubMember(unitID)
@@ -261,6 +265,15 @@ function Scanner:cancelHover()
 	self.hoverPrevious = nil
 end
 
+function Scanner:pauseForActivity()
+	self:cancelHover()
+	for unitID, pending in pairs(self.receivedPending) do
+		self.pendingRelease(pending)
+		self.receivedPending[unitID] = nil
+	end
+	wipe(self.receivedQueue)
+end
+
 --- Fraction (0..1) of MOUSEOVER_REQ_DELAY elapsed while hovering `guid`,
 -- or nil when no hover REQ is pending for them. Drives the tooltip
 -- indicator's countdown fill.
@@ -280,7 +293,7 @@ end
 -- re-publish user-selected units; an unchanged content version collapses
 -- the feedback to a no-op.
 function Scanner:onAdapterUpdate(adapter, unitID)
-	if ns.Util.isLoading() then
+	if ns.Util.isPaused() then
 		return
 	end
 	local guid
@@ -302,7 +315,7 @@ end
 -- section, so we queue a jittered ready time that collapses the burst into
 -- one extraction and keeps simultaneous receipts off the same tick.
 function Scanner:onAdapterReceived(adapter, unitID)
-	if ns.Util.isLoading() then
+	if ns.Util.isPaused() then
 		return
 	end
 
@@ -355,7 +368,7 @@ end
 
 --- Fire at most one ready received-profile publish per tick.
 function Scanner:drainReceived()
-	if ns.Util.isLoading() then
+	if ns.Util.isPaused() then
 		return
 
 	end
@@ -395,7 +408,7 @@ end
 -- Repeated publishes would only extend the TTL at an extraction per tick,
 -- so we also stop early when the version matches our last publish.
 function Scanner:share(adapter, unitID, guid)
-	if ns.Util.isLoading() then
+	if ns.Util.isPaused() then
 		return
 	end
 

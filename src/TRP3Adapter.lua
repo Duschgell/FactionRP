@@ -220,6 +220,10 @@ end
 -- never alias (and later serialize) TRP3's live tables.
 -- @return table|nil A profile object, or nil if TRP3 has no data for the unit.
 function TRP3Adapter:extract(unitID)
+	if ns.Util.isPaused() then
+		return nil
+	end
+
 	if not self:isAvailable() then
 		return nil
 	end
@@ -347,7 +351,7 @@ end
 -- session and disables the feature; callers then serve without a refresh.
 function TRP3Adapter:refreshQuery(unitID)
 
-	if ns.Util.isLoading() then
+	if ns.Util.isPaused() then
 		return false
 	end
 
@@ -402,7 +406,7 @@ end
 -- Mirrors the sequence TRP3 itself uses when receiving a profile.
 -- @return boolean Whether anything was injected.
 function TRP3Adapter:inject(unitID, data, classID)
-	if ns.Util.isLoading() then
+	if ns.Util.isPaused() then
 		return false
 	end
 
